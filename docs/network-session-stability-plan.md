@@ -53,7 +53,7 @@ likely affects `handle_prev` (line ~1759) — fix it there too.
 
 ### Step 2: Detect stale session before acting on user commands
 
-**File:** `repos/rust/src/lib.rs` — `spotifly_resume`, `spotifly_play_uri`, etc.
+**File:** `spotifly-code/rust/src/lib.rs` — `spotifly_resume`, `spotifly_play_uri`, etc.
 
 Currently, when the user clicks play on a zombie session, the old Player
 accepts the Play command and fires a Playing event, then the dead Spirc
@@ -71,7 +71,7 @@ ready when the user comes back.
 
 ### Step 3: Make transfer(None) conditional on reconnect
 
-**File:** `repos/rust/src/lib.rs` — `init_player_async`
+**File:** `spotifly-code/rust/src/lib.rs` — `init_player_async`
 
 Currently `transfer(None)` is called unconditionally after every reconnect.
 This re-fetches the full playback state from Spotify's servers and re-loads

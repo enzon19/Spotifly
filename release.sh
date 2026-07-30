@@ -131,7 +131,7 @@ if [ "$REPLACE_EXISTING" = true ]; then
 fi
 
 # Extract changelog entry for this version
-CHANGELOG_FILE="$HOME/code/spotifly/repos/CHANGELOG.md"
+CHANGELOG_FILE="$HOME/code/spotifly/spotifly-code/CHANGELOG.md"
 CHANGELOG_ENTRY=""
 if [ -f "$CHANGELOG_FILE" ]; then
     # Extract the section for this version (from ## [VERSION] to next ## or end)
