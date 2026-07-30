@@ -218,43 +218,42 @@ struct PlaylistRow: View {
     private let imageSize: CGFloat = 36
 
     var body: some View {
-        Button(action: onSelect) {
-            HStack(spacing: 10) {
-                // Playlist image
-                if let url = playlist.images.url(for: imageSize, scale: displayScale) {
-                    AsyncImage(url: url) { phase in
-                        switch phase {
-                        case .empty:
-                            playlistPlaceholder
-                        case let .success(image):
-                            image
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                                .frame(width: imageSize, height: imageSize)
-                                .clipShape(.rect(cornerRadius: 4))
-                        case .failure:
-                            playlistPlaceholder
-                        @unknown default:
-                            EmptyView()
-                        }
+        HStack(spacing: 10) {
+            // Playlist image
+            if let url = playlist.images.url(for: imageSize, scale: displayScale) {
+                AsyncImage(url: url) { phase in
+                    switch phase {
+                    case .empty:
+                        playlistPlaceholder
+                    case let .success(image):
+                        image
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                            .frame(width: imageSize, height: imageSize)
+                            .clipShape(.rect(cornerRadius: 4))
+                    case .failure:
+                        playlistPlaceholder
+                    @unknown default:
+                        EmptyView()
                     }
-                } else {
-                    playlistPlaceholder
                 }
-
-                // Playlist name
-                Text(playlist.name)
-                    .font(.system(size: 13))
-                    .lineLimit(1)
-
-                Spacer()
+            } else {
+                playlistPlaceholder
             }
+
+            // Playlist name
+            Text(playlist.name)
+                .font(.system(size: 13))
+                .lineLimit(1)
+
+            Spacer()
         }
-        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(isSelected ? Color.accentColor.opacity(0.2) : Color.clear)
         .contentShape(Rectangle())
+        .onTapGesture(perform: onSelect)
         .overlay(alignment: .trailing) {
             if isHovering {
                 Button {

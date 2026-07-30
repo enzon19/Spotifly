@@ -219,43 +219,42 @@ struct ArtistRow: View {
     private let imageSize: CGFloat = 36
 
     var body: some View {
-        Button(action: onSelect) {
-            HStack(spacing: 10) {
-                // Artist image (circular)
-                if let url = artist.images.url(for: imageSize, scale: displayScale) {
-                    AsyncImage(url: url) { phase in
-                        switch phase {
-                        case .empty:
-                            artistPlaceholder
-                        case let .success(image):
-                            image
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                                .frame(width: imageSize, height: imageSize)
-                                .clipShape(.circle)
-                        case .failure:
-                            artistPlaceholder
-                        @unknown default:
-                            EmptyView()
-                        }
+        HStack(spacing: 10) {
+            // Artist image (circular)
+            if let url = artist.images.url(for: imageSize, scale: displayScale) {
+                AsyncImage(url: url) { phase in
+                    switch phase {
+                    case .empty:
+                        artistPlaceholder
+                    case let .success(image):
+                        image
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                            .frame(width: imageSize, height: imageSize)
+                            .clipShape(.circle)
+                    case .failure:
+                        artistPlaceholder
+                    @unknown default:
+                        EmptyView()
                     }
-                } else {
-                    artistPlaceholder
                 }
-
-                // Artist name
-                Text(artist.name)
-                    .font(.system(size: 13))
-                    .lineLimit(1)
-
-                Spacer()
+            } else {
+                artistPlaceholder
             }
+
+            // Artist name
+            Text(artist.name)
+                .font(.system(size: 13))
+                .lineLimit(1)
+
+            Spacer()
         }
-        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(isSelected ? Color.accentColor.opacity(0.2) : Color.clear)
         .contentShape(Rectangle())
+        .onTapGesture(perform: onSelect)
         .overlay(alignment: .trailing) {
             if isHovering {
                 Button {
