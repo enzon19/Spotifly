@@ -8,7 +8,6 @@
 import SwiftUI
 
 struct PlaylistsListView: View {
-    @Environment(SpotifySession.self) private var session
     @Environment(AppStore.self) private var store
     @Environment(PlaylistService.self) private var playlistService
     @Environment(NavigationCoordinator.self) private var navigationCoordinator
@@ -185,11 +184,7 @@ struct PlaylistsListView: View {
     private func loadPlaylists(forceRefresh: Bool = false) async {
         errorMessage = nil
         do {
-            let token = await session.validAccessToken()
-            try await playlistService.loadUserPlaylists(
-                accessToken: token,
-                forceRefresh: forceRefresh,
-            )
+            try await playlistService.loadUserPlaylists(forceRefresh: forceRefresh)
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -197,8 +192,7 @@ struct PlaylistsListView: View {
 
     private func loadMorePlaylists() async {
         do {
-            let token = await session.validAccessToken()
-            try await playlistService.loadMorePlaylists(accessToken: token)
+            try await playlistService.loadMorePlaylists()
         } catch {
             errorMessage = error.localizedDescription
         }

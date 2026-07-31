@@ -12,42 +12,52 @@ import Foundation
 @Observable
 final class ArtistService {
     private let store: AppStore
-    private var userArtistsTask: Task<Void, Error>?
 
-    init(store: AppStore) {
+    /// Used by the loading entry points, which often decide there is nothing to
+    /// fetch. They take the token themselves, *after* deciding, so a cache hit
+    /// costs nothing.
+    private let tokenProvider: () async -> String
+
+    /// One run per artist ID — see `InFlightRequests`.
+    private let artistRequests = InFlightRequests<Void>()
+
+    /// The followed-artists list, whose pages are one run at a time under one key.
+    private let listRequests = InFlightRequests<Void>()
+    private static let listKey = "user-artists"
+
+    /// How many albums an artist page shows. The endpoint is not paginated here.
+    private let artistAlbumsLimit = 50
+
+    init(store: AppStore, tokenProvider: @escaping () async -> String) {
         self.store = store
+        self.tokenProvider = tokenProvider
     }
 
     // MARK: - User Artists (Followed)
 
-    /// Load user's followed artists
-    func loadUserArtists(accessToken: String, forceRefresh: Bool = false) async throws {
+    /// Load the next page of followed artists, or the first if none is loaded.
+    func loadUserArtists(forceRefresh: Bool = false) async throws {
         // Skip if already loaded and not forcing refresh (but only if we actually have data)
         if store.artistsPagination.isLoaded, !forceRefresh, !store.artistsPagination.hasMore, !store.userArtistIds.isEmpty {
             return
         }
 
-        // Handle force refresh
         if forceRefresh {
-            userArtistsTask?.cancel()
-            userArtistsTask = nil
+            listRequests.cancel(Self.listKey)
             store.artistsPagination.reset()
         }
 
-        // If already loading, await existing task
-        if let existingTask = userArtistsTask {
-            _ = try? await existingTask.value
-            return
-        }
-
-        // Create and store the loading task
-        // Artists use cursor-based pagination
-        let cursor = forceRefresh ? nil : store.artistsPagination.nextCursor
-        store.artistsPagination.isLoading = true
-        userArtistsTask = Task {
+        try await listRequests.run(Self.listKey) {
+            // Artists use cursor-based pagination
+            let cursor = self.store.artistsPagination.nextCursor
+            let accessToken = await self.tokenProvider()
+            self.store.artistsPagination.isLoading = true
             defer {
-                self.userArtistsTask = nil
-                self.store.artistsPagination.isLoading = false
+                // Only if this run is still the one loading: a superseded run
+                // must not clear the state its replacement just set.
+                if !Task.isCancelled {
+                    self.store.artistsPagination.isLoading = false
+                }
             }
 
             let response = try await SpotifyAPI.fetchUserArtists(
@@ -55,80 +65,85 @@ final class ArtistService {
                 limit: 20,
                 after: cursor,
             )
+            // See AlbumService.loadUserAlbums: a superseded run must not write.
+            try Task.checkCancellation()
 
-            // Convert to unified Artist entities
             let artists = response.artists.map { Artist(from: $0) }
-
-            // Upsert artists into store
             self.store.upsertArtists(artists)
 
-            // Update user artist IDs
             let artistIds = artists.map(\.id)
-            if forceRefresh {
+            if cursor == nil {
                 self.store.setUserArtistIds(artistIds)
             } else {
                 self.store.appendUserArtistIds(artistIds)
             }
 
-            // Update pagination state (cursor-based)
             self.store.artistsPagination.isLoaded = true
             self.store.artistsPagination.hasMore = response.hasMore
             self.store.artistsPagination.nextCursor = response.nextCursor
             self.store.artistsPagination.total = response.total
         }
-
-        try await userArtistsTask!.value
     }
 
     /// Load more artists (pagination)
-    func loadMoreArtists(accessToken: String) async throws {
-        guard store.artistsPagination.hasMore, userArtistsTask == nil else {
+    func loadMoreArtists() async throws {
+        guard store.artistsPagination.hasMore, !listRequests.isRunning(Self.listKey) else {
             return
         }
-        try await loadUserArtists(accessToken: accessToken)
+        try await loadUserArtists()
     }
 
     // MARK: - Artist Details
 
-    /// Fetch artist details
-    func fetchArtistDetails(artistId: String, accessToken: String) async throws -> Artist {
-        let details = try await SpotifyAPI.fetchArtistDetails(
-            accessToken: accessToken,
-            artistId: artistId,
-        )
+    /// Makes sure the artist's details *and* their album list are in the store.
+    ///
+    /// The album list used to live in `ArtistDetailView`'s `@State`, so it was
+    /// re-fetched on every visit and thrown away again. Now it is cached in the
+    /// store like album and playlist tracks are, and a second visit issues nothing.
+    /// Concurrent callers share one run, and the run outlives a caller whose view
+    /// was torn down mid-flight — see `InFlightRequests`.
+    func ensureArtistLoaded(artistId: String) async throws {
+        guard store.artists[artistId] == nil || store.artistAlbumIds[artistId] == nil else { return }
 
-        let artist = Artist(from: details)
-        store.upsertArtist(artist)
-        return artist
-    }
-
-    /// Get artist from store or fetch if needed
-    func getArtist(artistId: String, accessToken: String) async throws -> Artist {
-        if let artist = store.artists[artistId] {
-            return artist
+        try await artistRequests.run(artistId) {
+            try await self.loadArtist(artistId: artistId, accessToken: self.tokenProvider())
         }
-        return try await fetchArtistDetails(artistId: artistId, accessToken: accessToken)
     }
 
-    // MARK: - Artist Content
+    private func loadArtist(artistId: String, accessToken: String) async throws {
+        // Re-read inside the run: a caller can arrive just as another run finishes.
+        guard store.artists[artistId] != nil else {
+            async let detailsTask = SpotifyAPI.fetchArtistDetails(
+                accessToken: accessToken,
+                artistId: artistId,
+            )
+            async let albumsTask = SpotifyAPI.fetchArtistAlbums(
+                accessToken: accessToken,
+                artistId: artistId,
+                limit: artistAlbumsLimit,
+            )
+            let (details, artistAlbums) = try await (detailsTask, albumsTask)
 
-    /// Fetch artist's albums
-    func fetchArtistAlbums(
-        artistId: String,
-        accessToken: String,
-        limit: Int = 50,
-    ) async throws -> [Album] {
-        let searchAlbums = try await SpotifyAPI.fetchArtistAlbums(
+            store.upsertArtist(Artist(from: details))
+            storeAlbums(artistAlbums, for: artistId)
+            return
+        }
+
+        guard store.artistAlbumIds[artistId] == nil else { return }
+
+        let artistAlbums = try await SpotifyAPI.fetchArtistAlbums(
             accessToken: accessToken,
             artistId: artistId,
-            limit: limit,
+            limit: artistAlbumsLimit,
         )
+        storeAlbums(artistAlbums, for: artistId)
+    }
 
-        // Convert to unified Album entities
-        let albums = searchAlbums.map { Album(from: $0) }
+    /// Stores an artist's albums and records their order under the artist.
+    private func storeAlbums(_ artistAlbums: [APIAlbum], for artistId: String) {
+        let albums = artistAlbums.map { Album(from: $0) }
         store.upsertAlbums(albums)
-
-        return albums
+        store.setArtistAlbums(albums.map(\.id), for: artistId)
     }
 
     // MARK: - Follow/Unfollow Artist

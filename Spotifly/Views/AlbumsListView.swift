@@ -8,7 +8,6 @@
 import SwiftUI
 
 struct AlbumsListView: View {
-    @Environment(SpotifySession.self) private var session
     @Environment(AppStore.self) private var store
     @Environment(AlbumService.self) private var albumService
     @Environment(NavigationCoordinator.self) private var navigationCoordinator
@@ -186,11 +185,7 @@ struct AlbumsListView: View {
     private func loadAlbums(forceRefresh: Bool = false) async {
         errorMessage = nil
         do {
-            let token = await session.validAccessToken()
-            try await albumService.loadUserAlbums(
-                accessToken: token,
-                forceRefresh: forceRefresh,
-            )
+            try await albumService.loadUserAlbums(forceRefresh: forceRefresh)
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -198,8 +193,7 @@ struct AlbumsListView: View {
 
     private func loadMoreAlbums() async {
         do {
-            let token = await session.validAccessToken()
-            try await albumService.loadMoreAlbums(accessToken: token)
+            try await albumService.loadMoreAlbums()
         } catch {
             errorMessage = error.localizedDescription
         }

@@ -90,8 +90,7 @@ struct SearchAllTracksView: View {
         }
         .navigationTitle("section.tracks")
         .task(id: trackIds.joined()) {
-            let token = await session.validAccessToken()
-            await trackService.refreshFavoriteStatuses(trackIds: trackIds, accessToken: token)
+            await trackService.ensureFavoriteStatuses(trackIds: trackIds)
         }
     }
 

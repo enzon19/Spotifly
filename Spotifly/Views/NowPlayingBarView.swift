@@ -373,8 +373,7 @@ struct NowPlayingBarView: View {
     private func resolveCurrentTrackFavoriteStatusIfNeeded() async {
         guard let trackId = currentTrackId else { return }
 
-        let token = await session.validAccessToken()
-        await trackService.refreshFavoriteStatuses(trackIds: [trackId], accessToken: token)
+        await trackService.refreshFavoriteStatuses(trackIds: [trackId])
     }
 
     /// Unified volume (0-100 scale).

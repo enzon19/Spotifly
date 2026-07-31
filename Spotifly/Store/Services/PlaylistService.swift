@@ -12,42 +12,48 @@ import Foundation
 @Observable
 final class PlaylistService {
     private let store: AppStore
-    private var userPlaylistsTask: Task<Void, Error>?
-    private var playlistDetailsTasks: [String: Task<Playlist, Error>] = [:]
 
-    init(store: AppStore) {
+    /// Used by the loading entry points, which often decide there is nothing to
+    /// fetch. They take the token themselves, *after* deciding, so a cache hit
+    /// costs nothing.
+    private let tokenProvider: () async -> String
+
+    /// One run per playlist ID — see `InFlightRequests`.
+    private let playlistRequests = InFlightRequests<Void>()
+
+    /// The user's playlist list, whose pages are one run at a time under one key.
+    private let listRequests = InFlightRequests<Void>()
+    private static let listKey = "user-playlists"
+
+    init(store: AppStore, tokenProvider: @escaping () async -> String) {
         self.store = store
+        self.tokenProvider = tokenProvider
     }
 
     // MARK: - User Playlists
 
-    /// Load user's playlists
-    func loadUserPlaylists(accessToken: String, forceRefresh: Bool = false) async throws {
+    /// Load the next page of the user's playlists, or the first if none is loaded.
+    func loadUserPlaylists(forceRefresh: Bool = false) async throws {
         // Skip if already loaded and not forcing refresh (but only if we actually have data)
         if store.playlistsPagination.isLoaded, !forceRefresh, !store.playlistsPagination.hasMore, !store.userPlaylistIds.isEmpty {
             return
         }
 
-        // Handle force refresh
         if forceRefresh {
-            userPlaylistsTask?.cancel()
-            userPlaylistsTask = nil
+            listRequests.cancel(Self.listKey)
             store.playlistsPagination.reset()
         }
 
-        // If already loading, await existing task
-        if let existingTask = userPlaylistsTask {
-            _ = try? await existingTask.value
-            return
-        }
-
-        // Create and store the loading task
-        let offset = forceRefresh ? 0 : (store.playlistsPagination.nextOffset ?? 0)
-        store.playlistsPagination.isLoading = true
-        userPlaylistsTask = Task {
+        try await listRequests.run(Self.listKey) {
+            let offset = self.store.playlistsPagination.nextOffset ?? 0
+            let accessToken = await self.tokenProvider()
+            self.store.playlistsPagination.isLoading = true
             defer {
-                self.userPlaylistsTask = nil
-                self.store.playlistsPagination.isLoading = false
+                // Only if this run is still the one loading: a superseded run
+                // must not clear the state its replacement just set.
+                if !Task.isCancelled {
+                    self.store.playlistsPagination.isLoading = false
+                }
             }
 
             let response = try await SpotifyAPI.fetchUserPlaylists(
@@ -55,54 +61,74 @@ final class PlaylistService {
                 limit: 50,
                 offset: offset,
             )
+            // See AlbumService.loadUserAlbums: a superseded run must not write.
+            try Task.checkCancellation()
 
-            // Convert to unified Playlist entities
             let playlists = response.playlists.map { Playlist(from: $0) }
-
-            // Upsert playlists into store
             self.store.upsertPlaylists(playlists)
 
-            // Update user playlist IDs
             let playlistIds = playlists.map(\.id)
-            if forceRefresh {
+            if offset == 0 {
                 self.store.setUserPlaylistIds(playlistIds)
             } else {
                 self.store.appendUserPlaylistIds(playlistIds)
             }
 
-            // Update pagination state
             self.store.playlistsPagination.isLoaded = true
             self.store.playlistsPagination.hasMore = response.hasMore
             self.store.playlistsPagination.nextOffset = response.nextOffset
             self.store.playlistsPagination.total = response.total
         }
-
-        try await userPlaylistsTask!.value
     }
 
     /// Load more playlists (pagination)
-    func loadMorePlaylists(accessToken: String) async throws {
-        guard store.playlistsPagination.hasMore, userPlaylistsTask == nil else {
+    func loadMorePlaylists() async throws {
+        guard store.playlistsPagination.hasMore, !listRequests.isRunning(Self.listKey) else {
             return
         }
-        try await loadUserPlaylists(accessToken: accessToken)
+        try await loadUserPlaylists()
     }
 
     // MARK: - Playlist Details
 
-    /// Fetch playlist details and tracks
-    func fetchPlaylistDetails(playlistId: String, accessToken: String) async throws -> Playlist {
-        // If already fetching this playlist, await the existing task instead of starting a new one.
-        // View recreation (e.g. the Playlists 2->3 column switch) can re-trigger the caller's
-        // .task before the first fetch completes.
-        if let existingTask = playlistDetailsTasks[playlistId] {
-            return try await existingTask.value
+    /// Makes sure the playlist's metadata *and* its track list are in the store.
+    ///
+    /// Only what is missing goes over the network: a playlist that came from the
+    /// library list or a search result already has its metadata, so just its tracks
+    /// are fetched; on a second visit nothing is. Concurrent callers share one run,
+    /// and the run outlives a caller whose view was torn down mid-flight — see
+    /// `InFlightRequests`.
+    func ensurePlaylistLoaded(playlistId: String) async throws {
+        guard store.playlists[playlistId]?.tracksLoaded != true else { return }
+
+        try await playlistRequests.run(playlistId) {
+            try await self.loadPlaylist(playlistId: playlistId, accessToken: self.tokenProvider())
         }
+    }
 
-        let task = Task<Playlist, Error> {
-            defer { self.playlistDetailsTasks[playlistId] = nil }
+    /// Re-fetches a playlist's track list, ignoring the cached copy.
+    ///
+    /// The mutation paths need exactly this: they update the store optimistically,
+    /// so the cache holds the very order a rollback has to undo. Only the tracks are
+    /// re-fetched — a reorder or a bulk replace cannot change a playlist's metadata,
+    /// so making the rollback depend on a second request that can fail on its own
+    /// would only give it another way to leave the wrong order in place.
+    ///
+    /// It shares `ensurePlaylistLoaded`'s key, and therefore has to keep its
+    /// postcondition — a caller can join either one. So a playlist that is somehow
+    /// not in the store still gets loaded whole here; this only *adds* the guarantee
+    /// that the tracks are freshly fetched.
+    func reloadPlaylistTracks(playlistId: String) async throws {
+        playlistRequests.cancel(playlistId)
 
-            // Fetch details and tracks in parallel
+        try await playlistRequests.run(playlistId) {
+            try await self.loadPlaylist(playlistId: playlistId, accessToken: self.tokenProvider(), forceTracks: true)
+        }
+    }
+
+    private func loadPlaylist(playlistId: String, accessToken: String, forceTracks: Bool = false) async throws {
+        // Re-read inside the run: a caller can arrive just as another run finishes.
+        guard let known = store.playlists[playlistId] else {
             async let detailsTask = SpotifyAPI.fetchPlaylistDetails(
                 accessToken: accessToken,
                 playlistId: playlistId,
@@ -111,41 +137,34 @@ final class PlaylistService {
                 accessToken: accessToken,
                 playlistId: playlistId,
             )
-
             let (details, playlistTracks) = try await (detailsTask, tracksTask)
+            // A reload can supersede this run; it must not write over the fresher order.
+            try Task.checkCancellation()
 
-            // Convert tracks to unified entities and store them
-            let tracks = playlistTracks.map { Track(from: $0) }
-            self.store.upsertTracks(tracks)
-
-            // Calculate total duration
-            let totalDurationMs = tracks.reduce(0) { $0 + $1.durationMs }
-
-            // Create playlist with track IDs
-            let playlist = Playlist(
-                from: details,
-                trackIds: tracks.map(\.id),
-                totalDurationMs: totalDurationMs,
-            )
-
-            self.store.upsertPlaylist(playlist)
-            return playlist
+            store.upsertPlaylist(Playlist(from: details))
+            storeTracks(playlistTracks, for: playlistId)
+            return
         }
-        playlistDetailsTasks[playlistId] = task
 
-        return try await task.value
+        guard forceTracks || !known.tracksLoaded else { return }
+
+        let playlistTracks = try await SpotifyAPI.fetchPlaylistTracks(
+            accessToken: accessToken,
+            playlistId: playlistId,
+        )
+        try Task.checkCancellation()
+        storeTracks(playlistTracks, for: playlistId)
     }
 
-    /// Get tracks for a playlist (from store or fetch)
-    func getPlaylistTracks(playlistId: String, accessToken: String) async throws -> [Track] {
-        // Check if tracks are already loaded
-        if let playlist = store.playlists[playlistId], playlist.tracksLoaded {
-            return playlist.trackIds.compactMap { store.tracks[$0] }
-        }
-
-        // Fetch playlist details (which includes tracks)
-        let playlist = try await fetchPlaylistDetails(playlistId: playlistId, accessToken: accessToken)
-        return playlist.trackIds.compactMap { store.tracks[$0] }
+    /// Stores a playlist's tracks and marks its track list as loaded.
+    private func storeTracks(_ playlistTracks: [APITrack], for playlistId: String) {
+        let tracks = playlistTracks.map { Track(from: $0) }
+        store.upsertTracks(tracks)
+        store.setPlaylistTracks(
+            tracks.map(\.id),
+            totalDurationMs: tracks.reduce(0) { $0 + $1.durationMs },
+            for: playlistId,
+        )
     }
 
     // MARK: - Playlist Mutations
@@ -269,8 +288,8 @@ final class PlaylistService {
             rangeLength: rangeLength,
         )
 
-        // Re-fetch playlist to get updated track order
-        _ = try await fetchPlaylistDetails(playlistId: playlistId, accessToken: accessToken)
+        // Re-fetch to pick up the order the server actually applied
+        try await reloadPlaylistTracks(playlistId: playlistId)
     }
 
     /// Replace all tracks in a playlist (for bulk edits like reordering/removing)
@@ -286,6 +305,6 @@ final class PlaylistService {
         )
 
         // Re-fetch to update store with new track order
-        _ = try await fetchPlaylistDetails(playlistId: playlistId, accessToken: accessToken)
+        try await reloadPlaylistTracks(playlistId: playlistId)
     }
 }

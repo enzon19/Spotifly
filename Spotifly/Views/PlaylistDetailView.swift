@@ -9,11 +9,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct PlaylistDetailView: View {
-    /// ID is always required (either passed directly or derived from playlist object)
     let playlistId: String
-
-    /// Optional pre-loaded playlist (avoids network request if already have data)
-    private let initialPlaylist: Playlist?
 
     @Bindable var playbackViewModel: PlaybackViewModel
     @Environment(SpotifySession.self) private var session
@@ -23,8 +19,6 @@ struct PlaylistDetailView: View {
     @Environment(NavigationCoordinator.self) private var navigationCoordinator
     @Environment(\.displayScale) private var displayScale
 
-    @State private var playlist: Playlist?
-    @State private var isLoadingPlaylist = false
     @State private var isLoading = false
     @State private var errorMessage: String?
     @State private var showEditDetailsDialog = false
@@ -32,31 +26,28 @@ struct PlaylistDetailView: View {
     @State private var showUnfollowConfirmation = false
     @State private var editingPlaylistName = ""
     @State private var editingPlaylistDescription = ""
-    @State private var playlistName: String = ""
-    @State private var playlistDescription: String = ""
 
     // Drag-drop state
     @State private var draggedTrackId: String?
     @State private var draggedFromIndex: Int?
 
-    /// Initialize with a playlist ID (fetches playlist data)
-    init(playlistId: String, playbackViewModel: PlaybackViewModel) {
-        self.playlistId = playlistId
-        initialPlaylist = nil
-        self.playbackViewModel = playbackViewModel
+    /// The playlist from the store — the only copy. Whatever a load puts there
+    /// shows up here, including a load whose original view was torn down mid-flight.
+    private var playlist: Playlist? {
+        store.playlists[playlistId]
     }
 
-    /// Initialize with a pre-loaded playlist (avoids network request)
-    init(playlist: Playlist, playbackViewModel: PlaybackViewModel) {
-        playlistId = playlist.id
-        initialPlaylist = playlist
-        self.playbackViewModel = playbackViewModel
+    private var playlistName: String {
+        playlist?.name ?? ""
+    }
+
+    private var playlistDescription: String {
+        playlist?.description ?? ""
     }
 
     /// Tracks from the store for this playlist
     private var tracks: [Track] {
-        guard let storedPlaylist = store.playlists[playlistId] else { return [] }
-        return storedPlaylist.trackIds.compactMap { store.tracks[$0] }
+        playlist?.trackIds.compactMap { store.tracks[$0] } ?? []
     }
 
     /// Whether the current user owns this playlist
@@ -73,42 +64,21 @@ struct PlaylistDetailView: View {
         Group {
             if let playlist {
                 playlistContent(playlist)
-            } else if isLoadingPlaylist {
-                ProgressView()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let errorMessage {
-                VStack {
-                    Text(errorMessage)
-                        .foregroundStyle(.red)
-                    Button("action.try_again") {
-                        Task { await loadPlaylist() }
-                    }
+                InlineLoadError(message: errorMessage) {
+                    await loadPlaylist()
                 }
             } else {
                 ProgressView()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .navigationTitle(playlist?.name ?? "")
+        .navigationTitle(playlistName)
         .task(id: playlistId) {
-            // Use initial playlist if provided, otherwise fetch
-            if let initialPlaylist {
-                playlist = initialPlaylist
-                playlistName = initialPlaylist.name
-                playlistDescription = initialPlaylist.description ?? ""
-            } else {
-                await loadPlaylist()
-            }
-            await loadTracks()
+            await loadPlaylist()
         }
         .task(id: tracks.map(\.id).joined()) {
             await resolveFavoriteStatusesForTracks()
-        }
-        .onChange(of: playlistId) { _, _ in
-            if let playlist {
-                playlistName = playlist.name
-                playlistDescription = playlist.description ?? ""
-            }
         }
         .alert("playlist.edit_details.title", isPresented: $showEditDetailsDialog) {
             TextField("playlist.edit_details.name", text: $editingPlaylistName)
@@ -270,9 +240,9 @@ struct PlaylistDetailView: View {
             ProgressView("loading.tracks")
                 .padding()
         } else if let errorMessage {
-            Text(errorMessage)
-                .foregroundStyle(.red)
-                .padding()
+            InlineLoadError(message: errorMessage) {
+                await reloadTracks()
+            }
         } else if !tracks.isEmpty {
             normalTrackList
         }
@@ -333,6 +303,7 @@ struct PlaylistDetailView: View {
                         playlistId: playlistId,
                         draggedTrackId: $draggedTrackId,
                         draggedFromIndex: $draggedFromIndex,
+                        errorMessage: $errorMessage,
                         store: store,
                         playlistService: playlistService,
                         session: session,
@@ -389,8 +360,6 @@ struct PlaylistDetailView: View {
                     description: editingPlaylistDescription,
                     accessToken: token,
                 )
-                playlistName = trimmedName
-                playlistDescription = editingPlaylistDescription
             } catch {
                 errorMessage = String(localized: "error.update_playlist \(error.localizedDescription)")
             }
@@ -402,48 +371,42 @@ struct PlaylistDetailView: View {
     private func resolveFavoriteStatusesForTracks() async {
         guard !tracks.isEmpty else { return }
 
-        let token = await session.validAccessToken()
-        await trackService.refreshFavoriteStatuses(trackIds: tracks.map(\.id), accessToken: token)
+        await trackService.ensureFavoriteStatuses(trackIds: tracks.map(\.id))
     }
 
     private func loadPlaylist() async {
-        isLoadingPlaylist = true
+        // Only claim to be loading when the track list is actually missing —
+        // a cached playlist must not flash a spinner over its tracks.
+        isLoading = playlist?.tracksLoaded != true
         errorMessage = nil
 
-        let token = await session.validAccessToken()
         do {
-            let playlistEntity = try await playlistService.fetchPlaylistDetails(
-                playlistId: playlistId,
-                accessToken: token,
-            )
-            playlist = playlistEntity
-            playlistName = playlistEntity.name
-            playlistDescription = playlistEntity.description ?? ""
+            try await playlistService.ensurePlaylistLoaded(playlistId: playlistId)
         } catch {
-            errorMessage = error.localizedDescription
+            // A cancellation is this view going away, not a failure: the load keeps
+            // running and its result is in the store for whatever replaces us.
+            if !isCancellation(error) {
+                errorMessage = error.localizedDescription
+            }
         }
 
-        isLoadingPlaylist = false
+        isLoading = false
     }
 
-    private func loadTracks() async {
-        // Reset state when loading new playlist
-        if let playlist {
-            playlistName = playlist.name
-            playlistDescription = playlist.description ?? ""
-        }
+    /// The track-list retry. It re-fetches unconditionally rather than going through
+    /// `ensurePlaylistLoaded`, because the message it sits under can be a failed
+    /// reorder rollback — where the store holds a track list that *is* loaded and
+    /// wrong, so the cache-respecting call would fetch nothing.
+    private func reloadTracks() async {
         isLoading = true
         errorMessage = nil
 
         do {
-            let token = await session.validAccessToken()
-            // Load tracks via service (updates store)
-            _ = try await playlistService.getPlaylistTracks(
-                playlistId: playlistId,
-                accessToken: token,
-            )
+            try await playlistService.reloadPlaylistTracks(playlistId: playlistId)
         } catch {
-            errorMessage = error.localizedDescription
+            if !isCancellation(error) {
+                errorMessage = error.localizedDescription
+            }
         }
 
         isLoading = false
@@ -468,6 +431,7 @@ struct PlaylistReorderDropDelegate: DropDelegate {
     let playlistId: String
     @Binding var draggedTrackId: String?
     @Binding var draggedFromIndex: Int?
+    @Binding var errorMessage: String?
     let store: AppStore
     let playlistService: PlaylistService
     let session: SpotifySession
@@ -514,12 +478,20 @@ struct PlaylistReorderDropDelegate: DropDelegate {
                     accessToken: token,
                 )
             } catch {
+                // A newer reorder cancelled this one's reconciliation. It owns the
+                // final order now; rolling back here would only cancel it in turn.
+                guard !isCancellation(error) else { return }
+
                 debugLog("PlaylistReorder", "Failed to reorder: \(error)")
-                // Revert the optimistic update on failure by reloading
-                _ = try? await playlistService.getPlaylistTracks(
-                    playlistId: playlistId,
-                    accessToken: token,
-                )
+                // Revert the optimistic update by re-fetching the real order. This
+                // has to bypass the cache — the optimistic update already wrote the
+                // order we are trying to undo. If even that fails, say so: the list
+                // on screen is then not the one the server has.
+                do {
+                    try await playlistService.reloadPlaylistTracks(playlistId: playlistId)
+                } catch {
+                    errorMessage = String(localized: "error.reorder_tracks \(error.localizedDescription)")
+                }
             }
         }
 
