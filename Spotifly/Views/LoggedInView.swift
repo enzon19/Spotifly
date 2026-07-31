@@ -64,8 +64,6 @@ struct LoggedInView: View {
         playbackViewModel.setStore(store)
     }
 
-    private let reconnectWatchdogTimeoutSeconds: Double = 120
-
     @AppStorage("topItemsTimeRange") private var topItemsTimeRange: String = TopItemsTimeRange.mediumTerm.rawValue
 
     @State private var searchText = ""
@@ -101,7 +99,9 @@ struct LoggedInView: View {
             // months per Spotify's July 2026 policy) the session invalidates
             // itself; tear down and return the user to the sign-in flow.
             .onChange(of: session.isInvalidated) { _, invalidated in
-                if invalidated { onLogout() }
+                if invalidated {
+                    onLogout()
+                }
             }
     }
 
@@ -182,7 +182,6 @@ struct LoggedInView: View {
             session: session,
             store: store,
             topItemsTimeRange: topItemsTimeRange,
-            reconnectWatchdogTimeoutSeconds: reconnectWatchdogTimeoutSeconds,
             playbackViewModel: playbackViewModel,
             queueService: queueService,
             deviceService: deviceService,

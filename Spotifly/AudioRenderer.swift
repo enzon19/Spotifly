@@ -170,9 +170,20 @@ final nonisolated class AudioRenderer: @unchecked Sendable {
             let space = freeSpace
 
             if space == 0 {
+                // Once the consumer has stopped, nothing will ever drain the buffer, so
+                // waiting is waiting forever — the 500ms timeout only makes us loop. The
+                // caller here is librespot's player thread, and blocking it hangs the whole
+                // teardown at "Shutting down player thread". Drop the rest instead: it is
+                // audio for a renderer that is no longer playing.
+                guard isRendering else {
+                    bufferLock.unlock()
+                    return
+                }
+
                 writerIsWaiting = true
                 bufferLock.unlock()
-                // Block until pull side consumes data (timeout prevents deadlock on shutdown)
+                // Block until pull side consumes data (timeout bounds the wait so a stop
+                // that lands while we are parked here is noticed)
                 _ = spaceAvailable.wait(timeout: .now() + .milliseconds(500))
                 continue
             }
@@ -332,7 +343,23 @@ final nonisolated class AudioRenderer: @unchecked Sendable {
         renderQueue.sync { [self] in
             bufferLock.lock()
             guard !isRendering else {
+                // Already rendering, so the full pipeline reset below is skipped — a
+                // deliberate no-op, since flushing mid-playback would glitch the audio.
+                //
+                // But the throttle anchor must still be re-armed. It measures written
+                // audio against wall clock *since the anchor*, so any period where the
+                // writer was idle — an outage, a rebuild — banks credit against it. On the
+                // next write the throttle sees a large deficit, never sleeps, and lets the
+                // decoder run flat out until it catches up: playback races, EndOfTrack
+                // fires early, and Spirc advances the track while the renderer still has
+                // tens of seconds buffered.
+                //
+                // Re-anchoring is safe here: it only rebases the pacing budget and does
+                // not touch the ring buffer or its contents.
+                writeStartTime = ProcessInfo.processInfo.systemUptime
+                totalSamplesWritten = 0
                 bufferLock.unlock()
+                debugLog("AudioRenderer", "Start while already rendering — re-anchored throttle")
                 return
             }
             isRendering = true
@@ -357,6 +384,11 @@ final nonisolated class AudioRenderer: @unchecked Sendable {
             isRendering = false
             isRequestingData = false
             bufferLock.unlock()
+
+            // Wake a writer parked on a full buffer. It re-checks isRendering and returns
+            // rather than waiting for space that will never come now that the pull side is
+            // stopping.
+            spaceAvailable.signal()
 
             synchronizer.setRate(0.0, time: synchronizer.currentTime())
             renderer.stopRequestingMediaData()

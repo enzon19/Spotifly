@@ -91,8 +91,13 @@ final class PlaybackViewModel {
 
     var isShuffleEnabled = false
 
+    /// Whether Swift knows that Rust has completed at least one usable initialization.
+    /// This stays true through transient disconnects because Rust owns their recovery.
     private var isInitialized = false
+    /// Whether the local librespot session can currently provide advancing playback state.
+    private var isConnectionReady = false
     private var lastAlbumArtURL: String?
+    private var connectionStateSubscription: AnyCancellable?
     private var playbackStateSubscription: AnyCancellable?
     private var volumeSubscription: AnyCancellable?
     private var loadingSubscription: AnyCancellable?
@@ -108,8 +113,28 @@ final class PlaybackViewModel {
     private var seekSubscription: AnyCancellable?
     /// Token provider for reinitialization after session disconnect
     private var tokenProvider: (@Sendable () async -> String)?
+    /// The in-flight initialization or restart, so concurrent callers coalesce onto one
+    private var initializationTask: Task<Void, Never>?
+
+    /// Bumped when a logout invalidates whatever the player lifecycle is doing. Mirrors
+    /// Rust's session generation: cancellation is cooperative and the FFI calls do not
+    /// observe it, so an initialization already inside `spotifly_init_player` has to be
+    /// caught on the way out instead.
+    private var lifecycleGeneration: UInt64 = 0
+
+    /// True while a logout teardown is running. Suppresses the readiness adoption below: a
+    /// snapshot published before Rust's flags catch up would otherwise mark the player
+    /// initialized again, and the disconnected snapshots that follow deliberately do not
+    /// clear that flag — so the next account would skip initialization entirely.
+    private var isLoggingOut = false
+
+    /// The logout teardown in flight, if any. Later callers await it rather than starting a
+    /// second one — two would each reset `isLoggingOut` on their own way out, so the first
+    /// to finish would reopen the door while the other was still tearing down.
+    private var logoutTask: Task<Void, Never>?
 
     private init() {
+        setupConnectionStateSubscription()
         setupPlaybackStateSubscription()
         setupVolumeSubscription()
         setupVolumeDebounceSubscription()
@@ -139,23 +164,156 @@ final class PlaybackViewModel {
         tokenProvider = provider
     }
 
+    /// Tears down and rebuilds the player even if it is already initialized.
+    /// Used by the manual connection retry and by the wake fallback when Rust has no
+    /// session to reconnect.
     func forceReinitialize(accessToken: String) async {
+        await runInitialization(accessToken: accessToken, force: true)
+    }
+
+    /// Initializes the player unless it is already up.
+    func initializeIfNeeded(accessToken: String) async {
+        await runInitialization(accessToken: accessToken, force: false)
+    }
+
+    /// Tears the Rust session down on logout.
+    ///
+    /// Deliberately does not wait for an initialization that may be in flight. Waiting would
+    /// hang the logout behind a stalled network setup, and it is not needed: `shutdown()`
+    /// raises the teardown flag before it touches Spirc, and an initialization finishing
+    /// afterwards sees that flag and clears what it built instead of publishing it.
+    ///
+    /// Ordering against a *replacement* session is the caller's job — it awaits this before
+    /// clearing the auth state, so no login can start a rebuild until this has returned.
+    func shutdownForLogout() async {
+        // Invalidate an initialization in flight without waiting for it and without
+        // cancelling it. Waiting would hang the logout behind a stalled network setup;
+        // cancelling would be worse than useless, because `waitUntilReady` swallows it and
+        // would then spin on the main actor until its timeout. The run is left in place so a
+        // replacement login still serializes behind it — it just no longer owns the outcome,
+        // and tears down whatever it built once it notices the generation moved.
+        if let existing = logoutTask {
+            await existing.value
+            return
+        }
+
+        let task = Task { @MainActor in
+            lifecycleGeneration &+= 1
+            isInitialized = false
+            isLoggingOut = true
+            defer { isLoggingOut = false }
+
+            await SpotifyPlayer.shutdownAndCleanup()
+        }
+        logoutTask = task
+        await task.value
+        logoutTask = nil
+    }
+
+    /// Serializes every initialization and restart through one in-flight task.
+    ///
+    /// `@MainActor` stops two of these running *simultaneously*, but not from
+    /// *overlapping*: every `await` is a suspension point where another caller can enter,
+    /// and `SpotifyPlayer.initialize` performs a Rust cleanup followed by a rebuild. Two
+    /// overlapping calls can therefore interleave one call's cleanup with the other's
+    /// rebuild, which is how Swift ends up holding state belonging to a Rust generation
+    /// that has already been replaced.
+    ///
+    /// Late callers await the in-flight run instead of starting a competing one. That also
+    /// coalesces concurrent explicit rebuild requests, for which one rebuild is the correct
+    /// response.
+    private func runInitialization(accessToken: String, force: Bool) async {
+        // Nothing may build a player while one is being torn down. The view is still mounted
+        // during a logout, so a playback action or a startup task can land here — and it
+        // would capture the already-bumped lifecycle generation, so the stale-run check
+        // would wave it through while `spotifly_init_player` clears the teardown flag,
+        // re-announcing the account that just logged out.
+        guard !isLoggingOut else { return }
+
+        // Wait out whatever is in flight, then decide again. Coalescing onto it and
+        // returning is right when it was a healthy initialization — but it may equally have
+        // been a run for an account that has since logged out, and that one leaves the work
+        // undone. `isInitialized` distinguishes the two.
+        let generationBeforeWaiting = lifecycleGeneration
+        var waitedForAnother = false
+        while let existing = initializationTask {
+            await existing.value
+            if initializationTask == existing {
+                initializationTask = nil
+            }
+            waitedForAnother = true
+        }
+
+        // A run we waited for that left a healthy player has already served this caller,
+        // forced or not: what a forced rebuild asks for is a working session, and tearing
+        // the fresh one down to build another would be pure destruction.
+        if waitedForAnother, isInitialized {
+            return
+        }
+
+        // A logout can land while this caller is suspended above. Its access token belongs
+        // to the account that just left, so building with it would put that account straight
+        // back on Spotify Connect — and the lifecycle check inside `performInitialization`
+        // would not catch it, because by then the bumped generation is the current one.
+        guard generationBeforeWaiting == lifecycleGeneration else { return }
+        guard force || !isInitialized else { return }
+
+        let task = Task { @MainActor in
+            await performInitialization(accessToken: accessToken)
+        }
+        initializationTask = task
+        await task.value
+        // Only clear the slot while it is still ours: a logout drops the handle, and a
+        // replacement login may already have installed its own by the time this resumes.
+        if initializationTask == task {
+            initializationTask = nil
+        }
+    }
+
+    private func performInitialization(accessToken: String) async {
+        // We are about to tear down the Rust side, so nothing is initialized until the
+        // rebuild proves otherwise. Matters when initialize() throws on a restart.
         isInitialized = false
         isLoading = true
+        let generation = lifecycleGeneration
         do {
             try await SpotifyPlayer.initialize(accessToken: accessToken)
-            isInitialized = true
-            for _ in 0 ..< 50 {
-                if SpotifyPlayer.isSpircReady { break }
-                try? await Task.sleep(for: .milliseconds(100))
+
+            // Readiness is the authoritative condition, not "initialize() returned". The
+            // old code set isInitialized as soon as the FFI call came back and then polled
+            // Spirc while ignoring the timeout, so Swift could permanently believe the
+            // player was up while every Connect command failed — and initializeIfNeeded
+            // would then refuse to try again. Leaving the flag false on timeout means the
+            // next caller retries.
+            if await waitUntilReady() {
+                isInitialized = true
+                errorMessage = nil
+            } else {
+                debugLog("PlaybackViewModel", "Player did not become ready within \(Self.readinessTimeout)")
+                errorMessage = "Player did not become ready"
             }
         } catch {
             errorMessage = error.localizedDescription
         }
-        // Reset stale playback state — after reinit Rust has no track/context loaded.
+
+        // Checked on both paths on purpose. `spotifly_init_player` clears the teardown flags
+        // on its way in, so an initialization that overlapped a logout can bring a session up
+        // for an account that is gone — and it reports failure while doing so, because the
+        // logout's cleanup superseded it. Rust cannot always clear that itself: it only knows
+        // the attempt was superseded, not whether something newer legitimately owns the
+        // globals. Swift does know, so it takes them down here.
+        if generation != lifecycleGeneration {
+            debugLog("PlaybackViewModel", "Initialization outlived a logout — tearing it back down")
+            await SpotifyPlayer.shutdownAndCleanup()
+            isInitialized = false
+            errorMessage = nil
+        }
+
+        // Reset stale playback state — after (re)init Rust has no track/context loaded.
         // isPlaying must be false before updateNowPlayingPosition() so it writes rate=0.
         // updateNowPlayingPosition() must be called before zeroing trackDurationMs because
         // it guards on trackDurationMs > 0 and would silently no-op otherwise.
+        // Harmless on a first init, where these are already at their defaults.
         isPlaying = false
         updateNowPlayingPosition()
         currentTrackUri = nil
@@ -167,23 +325,22 @@ final class PlaybackViewModel {
         isLoading = false
     }
 
-    func initializeIfNeeded(accessToken: String) async {
-        guard !isInitialized else { return }
+    /// How long to wait for the player to become usable after initialization.
+    private static let readinessTimeout: Duration = .seconds(5)
 
-        isLoading = true
-        do {
-            try await SpotifyPlayer.initialize(accessToken: accessToken)
-            isInitialized = true
-
-            // Wait for Spirc to be ready (poll with timeout)
-            for _ in 0 ..< 50 { // 5 seconds max
-                if SpotifyPlayer.isSpircReady { break }
-                try? await Task.sleep(for: .milliseconds(100))
+    /// Polls until Rust reports a usable player, or the timeout expires.
+    ///
+    /// Both halves are required: every Spotifly control goes through Spirc, so a connected
+    /// session without a ready Spirc is not a player we can drive.
+    private func waitUntilReady() async -> Bool {
+        let deadline = ContinuousClock.now + Self.readinessTimeout
+        while ContinuousClock.now < deadline {
+            if SpotifyPlayer.isSessionConnected, SpotifyPlayer.isSpircReady {
+                return true
             }
-        } catch {
-            errorMessage = error.localizedDescription
+            try? await Task.sleep(for: .milliseconds(100))
         }
-        isLoading = false
+        return SpotifyPlayer.isSessionConnected && SpotifyPlayer.isSpircReady
     }
 
     func play(uriOrUrl: String, trackIndex: Int = -1, accessToken: String) async {
@@ -277,18 +434,26 @@ final class PlaybackViewModel {
 
     func togglePlayPause(trackId: String, accessToken: String) async {
         if isPlaying, currentTrackUri == trackId {
-            // Pause current track
-            SpotifyPlayer.pause()
-            isPlaying = false
+            // Route through pause() rather than calling the FFI directly: it carries the
+            // connectivity guard and the Web API fallback for remote devices, and it
+            // leaves isPlaying to the Mercury callback instead of asserting it here
+            pause()
         } else if !isPlaying, currentTrackUri == trackId {
-            // Resume current track
-            SpotifyPlayer.resume()
+            resume()
         } else {
             // Play new track
             await playTrack(trackId: trackId, accessToken: accessToken)
         }
     }
 
+    /// Stops playback and clears the view model's playback state. Called on logout.
+    ///
+    /// Deliberately not gated on the session being connected, unlike the transport commands.
+    /// Those go through Spirc, which rejects them without a session, so acting on them
+    /// locally would desync the UI. `spotifly_stop` instead stops the Player directly — a
+    /// local teardown, not a Connect command — and works while disconnected. Guarding it
+    /// meant logging out during an outage left buffered audio playing and the previous track
+    /// showing.
     func stop() {
         SpotifyPlayer.stop()
         isPlaying = false
@@ -303,28 +468,50 @@ final class PlaybackViewModel {
 
     // MARK: - Playback Control (via Spirc or Web API)
 
-    // Uses local Spirc when active device, Web API otherwise
-    // State updates come back via Mercury callback
-
-    func next() {
-        if SpotifyPlayer.isActiveDevice {
-            // During reconnection, session may not be fully connected yet
-            guard SpotifyPlayer.isSessionConnected else {
-                debugLog("PlaybackViewModel", "next() ignored - session not connected yet")
-                return
-            }
-            SpotifyPlayer.next()
-        } else {
-            // Remote control via Web API
+    /// Issues a transport command locally when Spotifly is the active device, and through
+    /// the Web API otherwise. Returns whether the command was issued at all.
+    ///
+    /// The local branch is gated on the session being connected: during a reconnect Rust
+    /// rejects commands, and the callers that move the UI optimistically must not do so for
+    /// a command that never happened — hence the `Bool` rather than a plain dispatch.
+    /// The remote branch reports failures through `errorMessage`; the local branch leaves
+    /// the resulting playback state to the Mercury callback.
+    @discardableResult
+    private func sendTransportCommand(
+        _ name: String,
+        local: () -> Void,
+        remote: @escaping (String) async throws -> Void,
+    ) -> Bool {
+        guard SpotifyPlayer.isActiveDevice else {
             Task {
                 guard let token = await tokenProvider?() else { return }
                 do {
-                    try await SpotifyAPI.skipToNext(accessToken: token)
+                    try await remote(token)
                 } catch {
                     errorMessage = error.localizedDescription
                 }
             }
+            return true
         }
+
+        // During reconnection, session may not be fully connected yet
+        guard SpotifyPlayer.isSessionConnected else {
+            debugLog("PlaybackViewModel", "\(name) ignored - session not connected yet")
+            return false
+        }
+        local()
+        return true
+    }
+
+    func next() {
+        guard sendTransportCommand(
+            "next()",
+            local: { SpotifyPlayer.next() },
+            remote: { try await SpotifyAPI.skipToNext(accessToken: $0) },
+        ) else {
+            return
+        }
+
         // Immediately reset position to 0 for responsive UI
         positionAnchorMs = 0
         positionAnchorTime = CACurrentMediaTime()
@@ -333,24 +520,14 @@ final class PlaybackViewModel {
     }
 
     func previous() {
-        if SpotifyPlayer.isActiveDevice {
-            // During reconnection, session may not be fully connected yet
-            guard SpotifyPlayer.isSessionConnected else {
-                debugLog("PlaybackViewModel", "previous() ignored - session not connected yet")
-                return
-            }
-            SpotifyPlayer.previous()
-        } else {
-            // Remote control via Web API
-            Task {
-                guard let token = await tokenProvider?() else { return }
-                do {
-                    try await SpotifyAPI.skipToPrevious(accessToken: token)
-                } catch {
-                    errorMessage = error.localizedDescription
-                }
-            }
+        guard sendTransportCommand(
+            "previous()",
+            local: { SpotifyPlayer.previous() },
+            remote: { try await SpotifyAPI.skipToPrevious(accessToken: $0) },
+        ) else {
+            return
         }
+
         // Immediately reset position to 0 for responsive UI
         positionAnchorMs = 0
         positionAnchorTime = CACurrentMediaTime()
@@ -370,46 +547,23 @@ final class PlaybackViewModel {
     }
 
     func pause() {
-        if SpotifyPlayer.isActiveDevice {
-            // During reconnection, session may not be fully connected yet
-            guard SpotifyPlayer.isSessionConnected else {
-                debugLog("PlaybackViewModel", "pause() ignored - session not connected yet")
-                return
-            }
-            SpotifyPlayer.pause()
-        } else {
-            // Remote control via Web API
-            Task {
-                guard let token = await tokenProvider?() else { return }
-                do {
-                    try await SpotifyAPI.pausePlayback(accessToken: token)
-                } catch {
-                    errorMessage = error.localizedDescription
-                }
-            }
-        }
         // State update will come from Mercury callback
+        sendTransportCommand(
+            "pause()",
+            local: { SpotifyPlayer.pause() },
+            remote: { try await SpotifyAPI.pausePlayback(accessToken: $0) },
+        )
     }
 
     func resume() {
-        if SpotifyPlayer.isActiveDevice {
-            // During reconnection, session may not be fully connected yet
-            guard SpotifyPlayer.isSessionConnected else {
-                debugLog("PlaybackViewModel", "resume() ignored - session not connected yet")
-                return
-            }
-            SpotifyPlayer.resume()
-        } else {
-            // Remote control via Web API
-            Task {
-                guard let token = await tokenProvider?() else { return }
-                do {
-                    try await SpotifyAPI.resumePlayback(accessToken: token)
-                } catch {
-                    errorMessage = error.localizedDescription
-                }
-            }
+        guard sendTransportCommand(
+            "resume()",
+            local: { SpotifyPlayer.resume() },
+            remote: { try await SpotifyAPI.resumePlayback(accessToken: $0) },
+        ) else {
+            return
         }
+
         // Don't call syncPositionAnchor() - Rust returns 0 immediately after resume
         // Keep the current positionAnchorMs (correct from paused state), just update the time
         positionAnchorTime = CACurrentMediaTime()
@@ -419,22 +573,11 @@ final class PlaybackViewModel {
     func toggleShuffle() {
         let targetShuffle = !isShuffleEnabled
 
-        if SpotifyPlayer.isActiveDevice {
-            guard SpotifyPlayer.isSessionConnected else {
-                debugLog("PlaybackViewModel", "toggleShuffle() ignored - session not connected yet")
-                return
-            }
-            SpotifyPlayer.setShuffle(targetShuffle)
-        } else {
-            Task {
-                guard let token = await tokenProvider?() else { return }
-                do {
-                    try await SpotifyAPI.setShuffle(accessToken: token, enabled: targetShuffle)
-                } catch {
-                    errorMessage = error.localizedDescription
-                }
-            }
-        }
+        sendTransportCommand(
+            "toggleShuffle()",
+            local: { SpotifyPlayer.setShuffle(targetShuffle) },
+            remote: { try await SpotifyAPI.setShuffle(accessToken: $0, enabled: targetShuffle) },
+        )
     }
 
     /// Returns true if there are tracks in the queue after the current track
@@ -597,7 +740,89 @@ final class PlaybackViewModel {
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
     }
 
-    // MARK: - Playback State Subscription
+    // MARK: - Player State Subscriptions
+
+    /// Adopts a successful Rust-owned recovery after an explicit Swift initialization failed.
+    ///
+    /// Do not clear `isInitialized` on a not-ready snapshot: a transient disconnect is owned
+    /// by Rust, and doing so would make the next user command start a destructive Swift
+    /// rebuild. An explicit initialization clears it itself before rebuilding.
+    private func setupConnectionStateSubscription() {
+        connectionStateSubscription = SpotifyPlayer.connectionState
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else {
+                    return
+                }
+
+                syncConnectionReadiness()
+
+                guard isConnectionReady,
+                      !isInitialized,
+                      !isLoggingOut,
+                      initializationTask == nil
+                else {
+                    return
+                }
+
+                debugLog("PlaybackViewModel", "Adopting successful Rust-owned recovery")
+                isInitialized = true
+                errorMessage = nil
+            }
+    }
+
+    /// Brings `isConnectionReady` in line with Rust, freezing the position when it drops.
+    ///
+    /// Reads the live flags rather than trusting the delivered snapshot, which may already
+    /// be stale by the time it arrives.
+    ///
+    /// Called from the connection-state callback *and* once a second from the drift check.
+    /// The second caller is deliberate: display interpolation now depends on this flag, so
+    /// a single missed callback would leave the progress bar stopped during healthy
+    /// playback — a more visible failure than the drift this prevents. Re-reading the flags
+    /// on the timer makes that self-heal within a second, and routing both callers through
+    /// here means the timer can never flip the flag without also freezing the position.
+    private func syncConnectionReadiness() {
+        let isReady = SpotifyPlayer.isSessionConnected && SpotifyPlayer.isSpircReady
+        guard isReady != isConnectionReady else { return }
+
+        if !isReady {
+            freezePositionForDisconnect()
+        }
+        isConnectionReady = isReady
+    }
+
+    /// Pins the displayed position where playback actually stopped.
+    ///
+    /// Which value is truthful depends on who was playing:
+    ///
+    /// - **Local playback**: Rust's last Player event. It stopped advancing when the Player
+    ///   did, so it is exactly where the audio ended.
+    /// - **Remote playback**: the displayed position. Rust's Player position belongs to a
+    ///   local Player that was not the one playing, so it is unrelated.
+    ///
+    /// The `rustPosition > 0` clause guards the gap between the two: Rust reports 0 both for
+    /// "at the start" and for "nothing loaded". Snapping a running progress bar to zero
+    /// because a rebuild cleared the position would be worse than holding the last shown
+    /// value — so a zero is only adopted when we have no anchor of our own either.
+    private func freezePositionForDisconnect() {
+        let displayedPosition = interpolatedPositionMs
+        let rustPosition = SpotifyPlayer.positionMs
+        let frozenPosition = if SpotifyPlayer.isActiveDevice,
+                                rustPosition > 0 || positionAnchorMs == 0
+        {
+            rustPosition
+        } else {
+            displayedPosition
+        }
+
+        positionAnchorMs = frozenPosition
+        positionAnchorTime = CACurrentMediaTime()
+        currentPositionMs = trackDurationMs > 0
+            ? min(frozenPosition, trackDurationMs)
+            : frozenPosition
+        debugLog("PlaybackViewModel", "Connection not ready, position frozen at \(frozenPosition)ms")
+    }
 
     /// Subscribe to playback state updates from Mercury/Spirc
     /// This allows external control (e.g., pause from phone) to be reflected in the app
@@ -669,18 +894,17 @@ final class PlaybackViewModel {
 
     /// Perform the actual seek operation (called after debouncing)
     private func performSeek(to positionMs: UInt32) {
-        if SpotifyPlayer.isActiveDevice {
-            SpotifyPlayer.seek(positionMs: positionMs)
-        } else {
-            // Remote control via Web API
-            Task {
-                guard let token = await tokenProvider?() else { return }
-                do {
-                    try await SpotifyAPI.seekToPosition(accessToken: token, positionMs: Int(positionMs))
-                } catch {
-                    errorMessage = error.localizedDescription
-                }
-            }
+        let issued = sendTransportCommand(
+            "performSeek",
+            local: { SpotifyPlayer.seek(positionMs: positionMs) },
+            remote: { try await SpotifyAPI.seekToPosition(accessToken: $0, positionMs: Int(positionMs)) },
+        )
+
+        // seek(to:) already moved the anchor so scrubbing feels immediate. If Rust rejected
+        // the command, re-sync from the real position instead of leaving the UI parked at a
+        // position playback never reached.
+        if !issued {
+            syncPositionAnchor()
         }
     }
 
@@ -692,6 +916,10 @@ final class PlaybackViewModel {
             "PlaybackViewModel",
             "Playback state update: playing=\(state.isPlaying), paused=\(state.isPaused), position=\(state.positionMs)ms, duration=\(state.durationMs)ms, shuffle=\(state.shuffle), uri=\(state.trackUri)",
         )
+
+        // Authoritative state from Rust — let any in-flight Web API bootstrap know it is
+        // now stale (see AppStore.liveStateRevision)
+        store?.noteLiveStateReceived()
 
         // Update playing state
         // When active device: use SpotifyPlayer.isPlaying (local Spirc state)
@@ -822,14 +1050,13 @@ final class PlaybackViewModel {
     // UI reads interpolatedPositionMs (computed), not currentPositionMs directly
     private var positionAnchorMs: UInt32 = 0
     private var positionAnchorTime: Double = CACurrentMediaTime()
-    private var lastRustPosition: UInt32 = 0
     private var driftCorrectionTimer: DriftCorrectionTimer?
     private var driftObserver: NSObjectProtocol?
 
     /// Computed position using anchor interpolation - UI should bind to this
     /// Called by TimelineView on every frame for smooth updates
     var interpolatedPositionMs: UInt32 {
-        guard isPlaying else { return currentPositionMs }
+        guard isPlaying, isConnectionReady else { return currentPositionMs }
         let elapsed = CACurrentMediaTime() - positionAnchorTime
         let elapsedMs = UInt32(max(0, min(elapsed * 1000, Double(UInt32.max - 1))))
         let interpolated = positionAnchorMs.addingReportingOverflow(elapsedMs).partialValue
@@ -867,7 +1094,6 @@ final class PlaybackViewModel {
         debugLog("PlaybackViewModel", "syncPositionAnchor: rustPosition=\(rustPosition), was positionAnchorMs=\(positionAnchorMs)")
         positionAnchorMs = rustPosition
         positionAnchorTime = CACurrentMediaTime()
-        lastRustPosition = rustPosition
         currentPositionMs = rustPosition
     }
 
@@ -881,6 +1107,10 @@ final class PlaybackViewModel {
             }
         }
 
+        // Readiness gates interpolation, so recover here from a callback that never arrived
+        // rather than leaving the progress bar stopped until the next one does.
+        syncConnectionReadiness()
+
         // Sync playing state with Rust - only when we're the active device
         // When monitoring remote playback, state comes from cluster updates
         if SpotifyPlayer.isActiveDevice {
@@ -892,22 +1122,24 @@ final class PlaybackViewModel {
             }
         }
 
-        // Skip position updates while paused - position only changes during playback
-        guard isPlaying else { return }
+        // A held position is honest while disconnected: Rust has no advancing Player state
+        // to anchor interpolation to, and will rehydrate from its last raw position.
+        guard isPlaying, isConnectionReady else { return }
 
         // Check for significant drift from Rust position - only when active device
-        // Remote playback position is interpolated from cluster timestamp, not real-time
+        // Remote playback position is interpolated from cluster timestamp, not real-time.
+        // Compare even when the Rust value did not change: a frozen value is precisely the
+        // signal that must pull a still-running Swift clock back to reality.
         if SpotifyPlayer.isActiveDevice {
             let rustPosition = SpotifyPlayer.positionMs
-            if rustPosition != lastRustPosition {
-                let drift = abs(Int32(rustPosition) - Int32(interpolatedPositionMs))
-                if drift > 500 {
-                    positionAnchorMs = rustPosition
-                    positionAnchorTime = CACurrentMediaTime()
-                    currentPositionMs = min(rustPosition, trackDurationMs)
-                    didCorrectDrift = true
-                }
-                lastRustPosition = rustPosition
+            let drift = abs(Int64(rustPosition) - Int64(interpolatedPositionMs))
+            if drift > 500 {
+                positionAnchorMs = rustPosition
+                positionAnchorTime = CACurrentMediaTime()
+                currentPositionMs = trackDurationMs > 0
+                    ? min(rustPosition, trackDurationMs)
+                    : rustPosition
+                didCorrectDrift = true
             }
         }
     }

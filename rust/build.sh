@@ -8,6 +8,21 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUST_DIR="$SCRIPT_DIR"
 OUTPUT_DIR="$SCRIPT_DIR/../build/rust"
+LIBRESPOT_DIR="$SCRIPT_DIR/../../librespot"
+
+# Build against whatever is checked out in the sibling librespot repo. Spotifly no longer
+# requires a patched librespot: the reconnect rewrite rebuilds Session, Player, Mixer and
+# Spirc as one generation, which removed the need for both fork patches (verified against
+# official dev @ 9c7d756 — a real outage, rebuild and unattended track transition all
+# behave correctly unpatched).
+#
+# Deliberately unpinned so local librespot patches can be tried by just checking them out.
+# When a new librespot release lands, move to that release rather than tracking a branch.
+if [ ! -d "$LIBRESPOT_DIR" ]; then
+    echo "error: librespot checkout not found at $LIBRESPOT_DIR" >&2
+    echo "       See CONTRIBUTING.md for the expected directory layout." >&2
+    exit 1
+fi
 
 # Add cargo to PATH - check rustup first, then Homebrew
 if [ -f "$HOME/.cargo/bin/cargo" ]; then

@@ -470,9 +470,15 @@ final class AppStore {
 
     /// Update playlist details
     func updatePlaylistDetails(id: String, name: String? = nil, description: String? = nil, isPublic: Bool? = nil) {
-        if let name { playlists[id]?.name = name }
-        if let description { playlists[id]?.description = description }
-        if let isPublic { playlists[id]?.isPublic = isPublic }
+        if let name {
+            playlists[id]?.name = name
+        }
+        if let description {
+            playlists[id]?.description = description
+        }
+        if let isPublic {
+            playlists[id]?.isPublic = isPublic
+        }
     }
 
     /// Add a new playlist to user's library
@@ -534,6 +540,33 @@ final class AppStore {
 
     func setRecentItemURIs(_ uris: [String]) {
         recentItemURIs = uris
+    }
+
+    // MARK: - Live State Freshness
+
+    /// Monotonic counter bumped whenever live playback or queue state from Rust is accepted.
+    ///
+    /// The Web API bootstrap captures this before issuing its requests and re-checks it
+    /// before applying the response, so a Rust callback that lands while those requests are
+    /// in flight wins over the older network snapshot. Without it, reconnecting or
+    /// transferring could show the correct live state and then replace it with a stale
+    /// Web API one.
+    ///
+    /// Deliberately one counter for playback and queue together rather than two. Splitting
+    /// them looks more precise but is not: both halves carry the current track, so a
+    /// per-half check lets a stale queue response reinstate the track a live playback
+    /// callback has just moved on from. All-or-nothing keeps the two consistent.
+    ///
+    /// It is coarser — a queue response can be discarded because a playback callback
+    /// arrived — and that costs nothing for the callers whose live callbacks are replacing
+    /// the state anyway. The one caller it does cost is the refresh scheduled after a
+    /// provisional `SetQueue`, which is waiting for a queue no callback is going to deliver;
+    /// that one retries (see `QueueService.scheduleQueueRefresh`).
+    private(set) var liveStateRevision: UInt64 = 0
+
+    /// Records that authoritative state arrived from Rust.
+    func noteLiveStateReceived() {
+        liveStateRevision &+= 1
     }
 
     // MARK: - Queue Actions

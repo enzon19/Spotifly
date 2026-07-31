@@ -69,11 +69,15 @@ final class QueueService {
             && notification.prevTracks.isEmpty
         if isProvisional {
             debugLog("QueueService", "Provisional SetQueue (emitted before fill_up) — keeping existing queue, scheduling refresh")
+            // Deliberately does not bump the live-state revision: this notification carries
+            // no usable queue, and the refresh it schedules is a Web API fetch that the
+            // freshness barrier would otherwise discard as stale.
             scheduleQueueRefresh()
             return
         }
 
         cancelPendingQueueRefresh()
+        store.noteLiveStateReceived()
 
         /// Convert to QueueEntries
         func toQueueEntry(_ trackInfo: SetQueueTrackInfo) -> QueueEntry? {
@@ -97,13 +101,33 @@ final class QueueService {
         fetchTrackMetadata(for: allIds)
     }
 
+    /// Number of times a queue refresh may be re-attempted after coming back empty-handed.
+    private static let queueRefreshAttempts = 3
+
     private func scheduleQueueRefresh() {
         pendingQueueRefreshTask?.cancel()
         pendingQueueRefreshTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(800))
-            guard !Task.isCancelled, let self else { return }
-            let token = await tokenProvider()
-            await fetchInitialPlaybackState(accessToken: token)
+            // This refresh exists to recover a queue librespot has not filled in yet, so it
+            // is the one caller of the bootstrap that cannot simply accept a discarded
+            // response. A live callback landing mid-fetch drops the whole Web API snapshot,
+            // including the queue being waited for, and nothing else would go looking for it
+            // again. Retrying is bounded so a steady stream of callbacks cannot keep it
+            // alive; a real SetQueue cancels the task outright.
+            //
+            // Each attempt issues fresh requests and captures the live revision anew, so a
+            // retry is not the discarded snapshot coming back — it is a newer one, taken
+            // after the callback that invalidated the last. What it cannot rule out is the
+            // Web API lagging the live state, which is what the sleep before each attempt is
+            // for, and which every caller of the bootstrap already accepts.
+            for _ in 0 ..< Self.queueRefreshAttempts {
+                try? await Task.sleep(for: .milliseconds(800))
+                guard !Task.isCancelled, let self else { return }
+                let token = await tokenProvider()
+                if await fetchInitialPlaybackState(accessToken: token) {
+                    return
+                }
+                debugLog("QueueService", "Queue refresh did not apply — retrying")
+            }
         }
     }
 
@@ -136,6 +160,7 @@ final class QueueService {
             debugLog("QueueService", "Queue updated from Web API: current=\(currentEntry != nil ? 1 : 0), next=\(nextEntries.count) (preserving previous)")
         }
 
+        store.noteLiveStateReceived()
         store.setQueue(previous: previousEntries, current: currentEntry, next: nextEntries)
 
         // Real queue arrived — cancel any pending Web API refresh
@@ -259,8 +284,22 @@ final class QueueService {
     /// Fetches initial playback state and queue from Web API.
     /// Called after Spirc becomes ready to sync with whatever device is currently playing.
     /// Mercury only receives push updates, so we need this to get the current state.
-    func fetchInitialPlaybackState(accessToken: String) async {
+    ///
+    /// - Returns: `false` when nothing was applied, either because the request failed or
+    ///   because live state from Rust advanced while it was in flight. Most callers can
+    ///   ignore that — a discarded response means the live callbacks already told Swift
+    ///   what it was about to learn. Whether the queue *contents* changed is not a usable
+    ///   substitute: a provisional `SetQueue` preserves the previous queue, so a discarded
+    ///   response and an applied one can leave identical-looking state.
+    @discardableResult
+    func fetchInitialPlaybackState(accessToken: String) async -> Bool {
         debugLog("QueueService", "Fetching initial playback state from Web API...")
+
+        // Freshness barrier: remember where live state stood before going to the network.
+        // Rust callbacks can land while these requests are in flight, and they are
+        // authoritative — applying the response afterwards would replace correct live state
+        // with an older snapshot, which looks like Swift not knowing what Rust is doing.
+        let revisionBeforeFetch = store.liveStateRevision
 
         // Fetch playback state and queue in parallel
         async let playbackStateTask = SpotifyAPI.fetchPlaybackState(accessToken: accessToken)
@@ -268,6 +307,14 @@ final class QueueService {
 
         do {
             let (playbackState, queueResponse) = try await (playbackStateTask, queueTask)
+
+            guard store.liveStateRevision == revisionBeforeFetch else {
+                debugLog(
+                    "QueueService",
+                    "Discarding Web API bootstrap: live state advanced from \(revisionBeforeFetch) to \(store.liveStateRevision) while fetching",
+                )
+                return false
+            }
 
             // Process queue response
             let currentEntry: QueueEntry? = queueResponse.currentlyPlaying.flatMap { track in
@@ -318,8 +365,11 @@ final class QueueService {
                     shuffleEnabled: state.shuffleState ?? false,
                 )
             }
+
+            return true
         } catch {
             debugLog("QueueService", "Failed to fetch initial playback state: \(error)")
+            return false
         }
     }
 }

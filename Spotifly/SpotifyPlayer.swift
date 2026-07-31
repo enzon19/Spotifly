@@ -81,6 +81,26 @@ struct PlaybackState: Equatable {
     nonisolated let timestampMs: Int64
 }
 
+// MARK: - Bridge Subjects
+
+//
+// These are `nonisolated(unsafe)` globals reached from Rust's own threads, so there is
+// one rule for all of them: **every non-audio callback hops to the main actor before
+// sending**. Two reasons, and the first is the one that bites:
+//
+//  1. Several Rust tasks publish independently — the player event listener, the cluster
+//     listener, and the reconnect loop can all call into Swift at the same time. Combine
+//     subjects are not safe against concurrent `send`, and a subscriber-side
+//     `.receive(on:)` cannot help, because it hops *after* the subject has already
+//     delivered. Hopping first serializes every send onto one executor.
+//  2. Not every subscriber hops. SwiftUI's `.onReceive` delivers on whatever thread the
+//     publisher emits on, so a view observing these directly would mutate `@State` off
+//     the main thread — which is exactly the "Publishing changes from background threads"
+//     runtime warning.
+//
+// Audio data does not go through here; it has its own real-time-safe path and must never
+// be routed onto the main actor.
+
 /// Global subject for queue updates (nonisolated for C callback access)
 private nonisolated(unsafe) let queueSubject = CurrentValueSubject<QueueState?, Never>(nil)
 
@@ -126,16 +146,110 @@ struct SessionClientChangedNotification {
     nonisolated let clientModelName: String
 }
 
-/// Connection state from librespot (nonisolated for C callback compatibility)
-struct LibrespotConnectionState: Equatable, Encodable {
-    nonisolated let sessionConnected: Bool
-    nonisolated let sessionConnectionId: String?
-    nonisolated let spircReady: Bool
-    nonisolated let deviceId: String?
-    nonisolated let deviceName: String
-    nonisolated let reconnectAttempt: UInt32
-    nonisolated let lastError: String?
-    nonisolated let connectedSinceMs: UInt64?
+/// Connection state from librespot.
+///
+/// The whole type is `nonisolated` rather than each stored property: the project builds
+/// with `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, so a plain declaration would get a
+/// main-actor-isolated `Decodable` conformance that the C callbacks (which run on Rust
+/// threads) cannot use. Annotating the properties alone is not enough — the *conformance*
+/// has to be nonisolated too.
+nonisolated struct LibrespotConnectionState: Equatable, Codable {
+    /// Monotonic counter assigned by Rust while the snapshot was built. Only used to order
+    /// snapshots on arrival; carries no state of its own.
+    let revision: UInt64
+    let sessionConnected: Bool
+    let sessionConnectionId: String?
+    let spircReady: Bool
+    let deviceId: String?
+    let deviceName: String
+    let reconnectAttempt: UInt32
+    let lastError: String?
+    let connectedSinceMs: UInt64?
+    /// Whether Spotifly is the active Connect device, derived in Rust from the cluster's
+    /// active device ID. The single fact that playback routing and the UI both read.
+    let isActiveDevice: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case revision
+        case sessionConnected = "session_connected"
+        case sessionConnectionId = "session_connection_id"
+        case spircReady = "spirc_ready"
+        case deviceId = "device_id"
+        case deviceName = "device_name"
+        case reconnectAttempt = "reconnect_attempt"
+        case lastError = "last_error"
+        case connectedSinceMs = "connected_since_ms"
+        case isActiveDevice = "is_active_device"
+    }
+}
+
+/// Decodes a connection-state payload emitted by Rust.
+///
+/// Shared by the push callback and the synchronous `getConnectionState()` pull so the
+/// two cannot drift apart. Required fields are non-optional on purpose: if the Rust
+/// payload ever renames or drops one, decoding fails loudly here instead of silently
+/// producing `false`/`0`/`""`, which would be indistinguishable from a genuinely
+/// disconnected session. Only the fields Rust models as `Option` are optional.
+private nonisolated func decodeConnectionState(
+    _ jsonPtr: UnsafePointer<CChar>?,
+    context: String,
+) -> LibrespotConnectionState? {
+    guard let jsonPtr else {
+        debugLog("SpotifyPlayer", "\(context): jsonPtr is nil")
+        return nil
+    }
+
+    let jsonString = String(cString: jsonPtr)
+    guard let data = jsonString.data(using: .utf8) else {
+        debugLog("SpotifyPlayer", "\(context): payload is not valid UTF-8")
+        return nil
+    }
+
+    do {
+        return try JSONDecoder().decode(LibrespotConnectionState.self, from: data)
+    } catch {
+        debugLog(
+            "SpotifyPlayer",
+            "\(context): failed to decode connection state: \(error) — payload: \(jsonString)",
+        )
+        return nil
+    }
+}
+
+/// Decodes a JSON-object payload delivered by a Rust callback.
+///
+/// Every JSON callback arrives with the same three failure modes — a nil pointer, bytes
+/// that are not UTF-8, or a payload that is not a JSON object — and none of them is
+/// recoverable, so they are logged against the caller's `context` and reported as nil.
+/// `JSONSerialization` rather than `Decodable`, because a `Decodable` conformance would be
+/// main-actor-isolated under `SWIFT_DEFAULT_ACTOR_ISOLATION` and these run on Rust threads.
+private nonisolated func decodeJSONObject(
+    _ jsonPtr: UnsafePointer<CChar>?,
+    context: String,
+) -> [String: Any]? {
+    guard let jsonPtr else {
+        debugLog("SpotifyPlayer", "\(context): jsonPtr is nil")
+        return nil
+    }
+
+    let jsonString = String(cString: jsonPtr)
+    debugLog("SpotifyPlayer", "\(context): \(jsonString.prefix(500))")
+
+    guard let data = jsonString.data(using: .utf8) else {
+        debugLog("SpotifyPlayer", "\(context): payload is not valid UTF-8")
+        return nil
+    }
+
+    do {
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            debugLog("SpotifyPlayer", "\(context): payload is not a JSON object")
+            return nil
+        }
+        return json
+    } catch {
+        debugLog("SpotifyPlayer", "\(context): failed to parse JSON: \(error)")
+        return nil
+    }
 }
 
 /// Global subject for queue changed notifications (nonisolated for C callback access)
@@ -187,13 +301,6 @@ private nonisolated func registerPlaybackStateCallback() {
     }
 }
 
-/// Registers the state update callback with Rust (fires on track changes)
-private nonisolated func registerStateUpdateCallback() {
-    spotifly_register_state_update_callback {
-        handleStateUpdateCallback()
-    }
-}
-
 /// Registers the volume callback with Rust (fires on remote volume changes)
 private nonisolated func registerVolumeCallback() {
     spotifly_register_volume_callback { volume in
@@ -204,7 +311,7 @@ private nonisolated func registerVolumeCallback() {
 /// C callback for volume change notifications from Rust
 private nonisolated func handleVolumeCallback(_ volume: UInt16) {
     debugLog("SpotifyPlayer", "Volume callback: \(volume)")
-    volumeSubject.send(volume)
+    Task { @MainActor in volumeSubject.send(volume) }
 }
 
 /// Registers the loading callback with Rust (fires when a track starts loading)
@@ -217,31 +324,13 @@ private nonisolated func registerLoadingCallback() {
 /// C callback for loading notifications from Rust
 /// Fires earlier than TrackChanged (~180ms vs ~620ms after remote command)
 private nonisolated func handleLoadingCallback(_ jsonPtr: UnsafePointer<CChar>?) {
-    guard let jsonPtr else {
-        debugLog("SpotifyPlayer", "handleLoadingCallback: jsonPtr is nil")
-        return
-    }
+    guard let json = decodeJSONObject(jsonPtr, context: "handleLoadingCallback") else { return }
 
-    let jsonString = String(cString: jsonPtr)
-    debugLog("SpotifyPlayer", "Loading callback: \(jsonString)")
-
-    guard let data = jsonString.data(using: .utf8) else {
-        return
-    }
-
-    do {
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return
-        }
-
-        let trackUri = json["track_uri"] as? String ?? ""
-        let positionMs = (json["position_ms"] as? NSNumber)?.uint32Value ?? 0
-
-        let notification = LoadingNotification(trackUri: trackUri, positionMs: positionMs)
-        loadingSubject.send(notification)
-    } catch {
-        debugLog("SpotifyPlayer", "Failed to parse loading JSON: \(error)")
-    }
+    let notification = LoadingNotification(
+        trackUri: json["track_uri"] as? String ?? "",
+        positionMs: (json["position_ms"] as? NSNumber)?.uint32Value ?? 0,
+    )
+    Task { @MainActor in loadingSubject.send(notification) }
 }
 
 /// Registers the queue changed callback with Rust (fires when remote device adds to queue)
@@ -258,69 +347,53 @@ private nonisolated func registerConnectionStateCallback() {
     }
 }
 
-/// C callback for connection state updates from Rust
+/// Revision of the snapshot `connectionStateSubject` currently holds.
+private var lastConnectionStateRevision: UInt64 = 0
+
+/// Publishes a snapshot unless a newer one already reached the subject.
+///
+/// Every snapshot Rust produces — pushed through the callback or pulled by
+/// `getConnectionState()` — enters here, so the watermark always describes what the subject
+/// holds. Several Rust tasks publish independently (the event listener, the cluster
+/// listener, the reconnect loop) and the hop to the main actor gives no ordering guarantee
+/// between them, so a delayed callback could otherwise deliver an older snapshot last and
+/// leave subscribers acting on a readiness that is no longer true.
+///
+/// Snapshots that survive are forwarded exactly as Rust produced them. Re-reading current
+/// state on arrival would also fix the ordering, but it erases readiness *edges*: a
+/// ready → not ready → ready sequence would read as "ready" twice, and the
+/// transition-based subscriber in `LoggedInLifecycleModifier` would never see the dip — so
+/// it would never re-sync queue and playback state after that recovery.
+///
+/// Dropping rather than resequencing is a deliberate trade. A late snapshot could in
+/// principle *be* the dip, and then that edge is lost too — but that needs the main actor
+/// stalled across a whole disconnect-and-rebuild, which takes seconds, and the missed
+/// re-sync is caught by the health check. The opposite trade, forwarding everything in
+/// arrival order, leaves a stale snapshot terminal, and subscribers then act on a readiness
+/// that is simply false with nothing to correct it.
+private func deliverConnectionState(_ state: LibrespotConnectionState) {
+    guard state.revision > lastConnectionStateRevision else { return }
+    lastConnectionStateRevision = state.revision
+    connectionStateSubject.send(state)
+}
+
+/// C callback for connection state updates from Rust.
 private nonisolated func handleConnectionStateCallback(_ jsonPtr: UnsafePointer<CChar>?) {
-    guard let jsonPtr else {
-        debugLog("SpotifyPlayer", "handleConnectionStateCallback: jsonPtr is nil")
+    guard let state = decodeConnectionState(jsonPtr, context: "handleConnectionStateCallback")
+    else {
         return
     }
 
-    let jsonString = String(cString: jsonPtr)
-    debugLog("SpotifyPlayer", "Connection state callback: \(jsonString)")
-
-    guard let data = jsonString.data(using: .utf8) else {
-        return
-    }
-
-    do {
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return
-        }
-
-        let state = LibrespotConnectionState(
-            sessionConnected: json["session_connected"] as? Bool ?? false,
-            sessionConnectionId: json["session_connection_id"] as? String,
-            spircReady: json["spirc_ready"] as? Bool ?? false,
-            deviceId: json["device_id"] as? String,
-            deviceName: json["device_name"] as? String ?? "Spotifly",
-            reconnectAttempt: (json["reconnect_attempt"] as? NSNumber)?.uint32Value ?? 0,
-            lastError: json["last_error"] as? String,
-            connectedSinceMs: (json["connected_since_ms"] as? NSNumber)?.uint64Value,
-        )
-
-        connectionStateSubject.send(state)
-    } catch {
-        debugLog("SpotifyPlayer", "Failed to parse connection state JSON: \(error)")
-    }
+    Task { @MainActor in deliverConnectionState(state) }
 }
 
 /// C callback for queue changed notifications from Rust
 /// Fires when a remote device adds a track to the queue
 private nonisolated func handleQueueChangedCallback(_ jsonPtr: UnsafePointer<CChar>?) {
-    guard let jsonPtr else {
-        debugLog("SpotifyPlayer", "handleQueueChangedCallback: jsonPtr is nil")
-        return
-    }
+    guard let json = decodeJSONObject(jsonPtr, context: "handleQueueChangedCallback") else { return }
 
-    let jsonString = String(cString: jsonPtr)
-    debugLog("SpotifyPlayer", "Queue changed callback: \(jsonString)")
-
-    guard let data = jsonString.data(using: .utf8) else {
-        return
-    }
-
-    do {
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return
-        }
-
-        let trackUri = json["track_uri"] as? String ?? ""
-        let notification = QueueChangedNotification(trackUri: trackUri)
-        queueChangedSubject.send(notification)
-
-    } catch {
-        debugLog("SpotifyPlayer", "Failed to parse queue changed JSON: \(error)")
-    }
+    let notification = QueueChangedNotification(trackUri: json["track_uri"] as? String ?? "")
+    Task { @MainActor in queueChangedSubject.send(notification) }
 }
 
 /// Registers the set queue callback with Rust (fires when queue is modified)
@@ -333,95 +406,54 @@ private nonisolated func registerSetQueueCallback() {
 /// C callback for set queue notifications from Rust
 /// Fires when the queue is set/modified or a context is loaded
 private nonisolated func handleSetQueueCallback(_ jsonPtr: UnsafePointer<CChar>?) {
-    guard let jsonPtr else {
-        debugLog("SpotifyPlayer", "handleSetQueueCallback: jsonPtr is nil")
-        return
-    }
+    guard let json = decodeJSONObject(jsonPtr, context: "handleSetQueueCallback") else { return }
 
-    let jsonString = String(cString: jsonPtr)
-    debugLog("SpotifyPlayer", "Set queue callback: \(jsonString.prefix(200))...")
-
-    guard let data = jsonString.data(using: .utf8) else {
-        return
-    }
-
-    do {
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return
-        }
-
-        // Parse context_uri
-        let contextUri = json["context_uri"] as? String ?? ""
-
-        // Parse current_track (optional object with uri and provider)
-        var currentTrack: SetQueueTrackInfo?
-        if let currentTrackJson = json["current_track"] as? [String: Any] {
-            currentTrack = SetQueueTrackInfo(
-                uri: currentTrackJson["uri"] as? String ?? "",
-                provider: currentTrackJson["provider"] as? String ?? "",
-            )
-        }
-
-        // Parse next_tracks array
-        let nextTracksJson = json["next_tracks"] as? [[String: Any]] ?? []
-        let nextTracks = nextTracksJson.map { track in
-            SetQueueTrackInfo(
-                uri: track["uri"] as? String ?? "",
-                provider: track["provider"] as? String ?? "",
-            )
-        }
-
-        // Parse prev_tracks array
-        let prevTracksJson = json["prev_tracks"] as? [[String: Any]] ?? []
-        let prevTracks = prevTracksJson.map { track in
-            SetQueueTrackInfo(
-                uri: track["uri"] as? String ?? "",
-                provider: track["provider"] as? String ?? "",
-            )
-        }
-
-        let notification = SetQueueNotification(
-            contextUri: contextUri,
-            currentTrack: currentTrack,
-            nextTracks: nextTracks,
-            prevTracks: prevTracks,
+    func toTrackInfo(_ track: [String: Any]) -> SetQueueTrackInfo {
+        SetQueueTrackInfo(
+            uri: track["uri"] as? String ?? "",
+            provider: track["provider"] as? String ?? "",
         )
-        setQueueSubject.send(notification)
+    }
 
-    } catch {
-        debugLog("SpotifyPlayer", "Failed to parse set queue JSON: \(error)")
+    let notification = SetQueueNotification(
+        contextUri: json["context_uri"] as? String ?? "",
+        currentTrack: (json["current_track"] as? [String: Any]).map(toTrackInfo),
+        nextTracks: (json["next_tracks"] as? [[String: Any]] ?? []).map(toTrackInfo),
+        prevTracks: (json["prev_tracks"] as? [[String: Any]] ?? []).map(toTrackInfo),
+    )
+    Task { @MainActor in setQueueSubject.send(notification) }
+}
+
+/// Registers the became-inactive callback with Rust
+private nonisolated func registerBecameInactiveCallback() {
+    spotifly_register_became_inactive_callback {
+        handleBecameInactiveCallback()
     }
 }
 
-/// Registers the session disconnected callback with Rust (fires when dealer connection closes)
-private nonisolated func registerSessionDisconnectedCallback() {
-    spotifly_register_session_disconnected_callback {
-        handleSessionDisconnectedCallback()
-    }
-}
-
-/// C callback for session disconnection notifications from Rust
-/// Fires when the Spotify session disconnects (e.g., idle timeout)
-private nonisolated func handleSessionDisconnectedCallback() {
-    debugLog("SpotifyPlayer", "Session disconnected event received - triggering reinit")
+/// C callback for Connect deactivation from Rust.
+/// Reports that another device took over playback — not that the connection failed.
+private nonisolated func handleBecameInactiveCallback() {
+    debugLog("SpotifyPlayer", "Became inactive - another device is now active")
     Task { @MainActor in
-        sessionDisconnectedSubject.send()
+        becameInactiveSubject.send()
     }
 }
 
-/// Registers the session connected callback with Rust (fires when session is ready)
-private nonisolated func registerSessionConnectedCallback() {
-    spotifly_register_session_connected_callback {
-        handleSessionConnectedCallback()
+/// Registers the became-active callback with Rust
+private nonisolated func registerBecameActiveCallback() {
+    spotifly_register_became_active_callback {
+        handleBecameActiveCallback()
     }
 }
 
-/// C callback for session connection notifications from Rust
-/// Fires when the Spotify session is connected and ready for playback commands
-private nonisolated func handleSessionConnectedCallback() {
-    debugLog("SpotifyPlayer", "Session connected event received - ready for commands")
+/// C callback for Connect activation from Rust.
+/// Reports that this device is now the active one — readiness comes from the
+/// connection snapshot, since the session was already connected before activation.
+private nonisolated func handleBecameActiveCallback() {
+    debugLog("SpotifyPlayer", "Became active - this device is now the active one")
     Task { @MainActor in
-        sessionConnectedSubject.send()
+        becameActiveSubject.send()
     }
 }
 
@@ -483,90 +515,48 @@ private nonisolated func registerSessionClientChangedCallback() {
 /// C callback for session client changed notifications from Rust
 /// Fires when the controlling Spotify client changes
 private nonisolated func handleSessionClientChangedCallback(_ jsonPtr: UnsafePointer<CChar>?) {
-    guard let jsonPtr else {
-        debugLog("SpotifyPlayer", "handleSessionClientChangedCallback: jsonPtr is nil")
+    guard let json = decodeJSONObject(jsonPtr, context: "handleSessionClientChangedCallback")
+    else {
         return
     }
 
-    let jsonString = String(cString: jsonPtr)
-    debugLog("SpotifyPlayer", "Session client changed: \(jsonString)")
+    let notification = SessionClientChangedNotification(
+        clientId: json["client_id"] as? String ?? "",
+        clientName: json["client_name"] as? String ?? "",
+        clientBrandName: json["client_brand_name"] as? String ?? "",
+        clientModelName: json["client_model_name"] as? String ?? "",
+    )
 
-    guard let data = jsonString.data(using: .utf8) else {
-        return
-    }
+    debugLog(
+        "SpotifyPlayer",
+        "Session client: \(notification.clientName) (\(notification.clientBrandName) \(notification.clientModelName))",
+    )
 
-    do {
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return
-        }
-
-        let notification = SessionClientChangedNotification(
-            clientId: json["client_id"] as? String ?? "",
-            clientName: json["client_name"] as? String ?? "",
-            clientBrandName: json["client_brand_name"] as? String ?? "",
-            clientModelName: json["client_model_name"] as? String ?? "",
-        )
-
-        debugLog(
-            "SpotifyPlayer",
-            "Session client: \(notification.clientName) (\(notification.clientBrandName) \(notification.clientModelName))",
-        )
-
-        sessionClientChangedSubject.send(notification)
-    } catch {
-        debugLog("SpotifyPlayer", "Failed to parse session client changed JSON: \(error)")
-    }
-}
-
-/// C callback for state update notifications from Rust
-private nonisolated func handleStateUpdateCallback() {
-    debugLog("SpotifyPlayer", "State update callback triggered")
+    Task { @MainActor in sessionClientChangedSubject.send(notification) }
 }
 
 /// C callback for playback state updates from Rust
 /// Uses manual JSON parsing to avoid Decodable actor isolation issues
 private nonisolated func handlePlaybackStateCallback(_ jsonPtr: UnsafePointer<CChar>?) {
-    debugLog("SpotifyPlayer", "handlePlaybackStateCallback called")
-
-    guard let jsonPtr else {
-        debugLog("SpotifyPlayer", "handlePlaybackStateCallback: jsonPtr is nil")
+    guard let json = decodeJSONObject(jsonPtr, context: "handlePlaybackStateCallback") else {
         return
     }
 
-    let jsonString = String(cString: jsonPtr)
-    debugLog("SpotifyPlayer", "handlePlaybackStateCallback received JSON (\(jsonString.count) chars)")
+    let state = PlaybackState(
+        isPlaying: json["is_playing"] as? Bool ?? false,
+        isPaused: json["is_paused"] as? Bool ?? false,
+        trackUri: json["track_uri"] as? String ?? "",
+        positionMs: (json["position_ms"] as? NSNumber)?.int64Value ?? 0,
+        durationMs: (json["duration_ms"] as? NSNumber)?.int64Value ?? 0,
+        shuffle: json["shuffle"] as? Bool ?? false,
+        repeatTrack: json["repeat_track"] as? Bool ?? false,
+        repeatContext: json["repeat_context"] as? Bool ?? false,
+        timestampMs: (json["timestamp_ms"] as? NSNumber)?.int64Value ?? 0,
+    )
 
-    guard let data = jsonString.data(using: .utf8) else {
-        debugLog("SpotifyPlayer", "handlePlaybackStateCallback: failed to convert JSON to data")
-        return
-    }
+    debugLog("SpotifyPlayer", "PlaybackState: playing=\(state.isPlaying), paused=\(state.isPaused), pos=\(state.positionMs)ms, dur=\(state.durationMs)ms, shuffle=\(state.shuffle), repeatTrack=\(state.repeatTrack), repeatContext=\(state.repeatContext)")
 
-    do {
-        // Use JSONSerialization instead of Decodable to avoid actor isolation issues
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            debugLog("SpotifyPlayer", "handlePlaybackStateCallback: JSON is not a dictionary")
-            return
-        }
-
-        let state = PlaybackState(
-            isPlaying: json["is_playing"] as? Bool ?? false,
-            isPaused: json["is_paused"] as? Bool ?? false,
-            trackUri: json["track_uri"] as? String ?? "",
-            positionMs: (json["position_ms"] as? NSNumber)?.int64Value ?? 0,
-            durationMs: (json["duration_ms"] as? NSNumber)?.int64Value ?? 0,
-            shuffle: json["shuffle"] as? Bool ?? false,
-            repeatTrack: json["repeat_track"] as? Bool ?? false,
-            repeatContext: json["repeat_context"] as? Bool ?? false,
-            timestampMs: (json["timestamp_ms"] as? NSNumber)?.int64Value ?? 0,
-        )
-
-        debugLog("SpotifyPlayer", "PlaybackState: playing=\(state.isPlaying), paused=\(state.isPaused), pos=\(state.positionMs)ms, dur=\(state.durationMs)ms, shuffle=\(state.shuffle), repeatTrack=\(state.repeatTrack), repeatContext=\(state.repeatContext)")
-
-        playbackStateSubject.send(state)
-    } catch {
-        debugLog("SpotifyPlayer", "Failed to parse playback state JSON: \(error)")
-        debugLog("SpotifyPlayer", "JSON preview: \(String(jsonString.prefix(500)))")
-    }
+    Task { @MainActor in playbackStateSubject.send(state) }
 }
 
 /// Parses a queue item from a JSON dictionary (manual parsing to avoid Decodable actor isolation issues)
@@ -589,65 +579,20 @@ private nonisolated func parseQueueItem(from dict: [String: Any]) -> QueueItem? 
 /// C callback for queue updates from Rust
 /// Uses manual JSON parsing to avoid Decodable actor isolation issues
 private nonisolated func handleQueueCallback(_ jsonPtr: UnsafePointer<CChar>?) {
-    debugLog("SpotifyPlayer", "handleQueueCallback called")
+    guard let json = decodeJSONObject(jsonPtr, context: "handleQueueCallback") else { return }
 
-    guard let jsonPtr else {
-        debugLog("SpotifyPlayer", "handleQueueCallback: jsonPtr is nil")
-        return
-    }
+    let state = QueueState(
+        currentTrack: (json["track"] as? [String: Any]).flatMap { parseQueueItem(from: $0) },
+        nextTracks: (json["next_tracks"] as? [[String: Any]] ?? []).compactMap { parseQueueItem(from: $0) },
+        previousTracks: (json["prev_tracks"] as? [[String: Any]] ?? []).compactMap { parseQueueItem(from: $0) },
+    )
 
-    let jsonString = String(cString: jsonPtr)
-    debugLog("SpotifyPlayer", "handleQueueCallback received JSON (\(jsonString.count) chars)")
+    let currentName = state.currentTrack?.name ?? "none"
+    let nextCount = state.nextTracks.count
+    let prevCount = state.previousTracks?.count ?? 0
+    debugLog("SpotifyPlayer", "handleQueueCallback: current='\(currentName)', next=\(nextCount), prev=\(prevCount)")
 
-    guard let data = jsonString.data(using: .utf8) else {
-        debugLog("SpotifyPlayer", "handleQueueCallback: failed to convert JSON to data")
-        return
-    }
-
-    do {
-        // Use JSONSerialization instead of Decodable to avoid actor isolation issues
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            debugLog("SpotifyPlayer", "handleQueueCallback: JSON is not a dictionary")
-            return
-        }
-
-        // Parse current track
-        let currentTrack: QueueItem? = if let trackDict = json["track"] as? [String: Any] {
-            parseQueueItem(from: trackDict)
-        } else {
-            nil
-        }
-
-        // Parse next tracks
-        let nextTracks: [QueueItem] = if let nextArray = json["next_tracks"] as? [[String: Any]] {
-            nextArray.compactMap { parseQueueItem(from: $0) }
-        } else {
-            []
-        }
-
-        // Parse previous tracks
-        let prevTracks: [QueueItem] = if let prevArray = json["prev_tracks"] as? [[String: Any]] {
-            prevArray.compactMap { parseQueueItem(from: $0) }
-        } else {
-            []
-        }
-
-        let state = QueueState(
-            currentTrack: currentTrack,
-            nextTracks: nextTracks,
-            previousTracks: prevTracks,
-        )
-
-        let currentName = state.currentTrack?.name ?? "none"
-        let nextCount = state.nextTracks.count
-        let prevCount = state.previousTracks?.count ?? 0
-        debugLog("SpotifyPlayer", "handleQueueCallback: current='\(currentName)', next=\(nextCount), prev=\(prevCount)")
-
-        queueSubject.send(state)
-    } catch {
-        debugLog("SpotifyPlayer", "Failed to parse queue JSON: \(error)")
-        debugLog("SpotifyPlayer", "JSON preview: \(String(jsonString.prefix(500)))")
-    }
+    Task { @MainActor in queueSubject.send(state) }
 }
 
 /// Errors that can occur during playback
@@ -671,11 +616,11 @@ enum SpotifyPlayerError: Error, LocalizedError {
     }
 }
 
-/// Global subject for session disconnection (needs reinit)
-private nonisolated(unsafe) let sessionDisconnectedSubject = PassthroughSubject<Void, Never>()
+/// Global subject for Connect deactivation (another device took over)
+private nonisolated(unsafe) let becameInactiveSubject = PassthroughSubject<Void, Never>()
 
-/// Global subject for session connection (ready for commands)
-private nonisolated(unsafe) let sessionConnectedSubject = PassthroughSubject<Void, Never>()
+/// Global subject for Connect activation (this device took over)
+private nonisolated(unsafe) let becameActiveSubject = PassthroughSubject<Void, Never>()
 
 /// Global subject for active device ID changes (from cluster updates)
 private nonisolated(unsafe) let activeDeviceSubject = PassthroughSubject<String, Never>()
@@ -691,13 +636,12 @@ enum SpotifyPlayer {
         registerAudioControlCallback()
         registerQueueCallback()
         registerPlaybackStateCallback()
-        registerStateUpdateCallback()
         registerVolumeCallback()
         registerLoadingCallback()
         registerQueueChangedCallback()
         registerSetQueueCallback()
-        registerSessionDisconnectedCallback()
-        registerSessionConnectedCallback()
+        registerBecameInactiveCallback()
+        registerBecameActiveCallback()
         registerSessionClientChangedCallback()
         registerConnectionStateCallback()
         registerActiveDeviceCallback()
@@ -765,16 +709,19 @@ enum SpotifyPlayer {
         setQueueSubject.eraseToAnyPublisher()
     }
 
-    /// Returns a publisher that emits when the session is disconnected and needs reinitialization.
-    /// Subscribe to this to trigger automatic reconnection with a fresh token.
-    static var sessionDisconnected: AnyPublisher<Void, Never> {
-        sessionDisconnectedSubject.eraseToAnyPublisher()
+    /// Emits when this device stops being the active Connect device.
+    ///
+    /// Activity, not health. Do not drive reconnection from this — use `connectionState`,
+    /// which is the authoritative source for whether commands can be sent.
+    static var becameInactive: AnyPublisher<Void, Never> {
+        becameInactiveSubject.eraseToAnyPublisher()
     }
 
-    /// Returns a publisher that emits when the session is connected and ready for commands.
-    /// Subscribe to this to enable playback controls after initialization or reconnection.
-    static var sessionConnected: AnyPublisher<Void, Never> {
-        sessionConnectedSubject.eraseToAnyPublisher()
+    /// Emits when this device becomes the active Connect device.
+    ///
+    /// Also activity, not readiness: the session was already connected beforehand.
+    static var becameActive: AnyPublisher<Void, Never> {
+        becameActiveSubject.eraseToAnyPublisher()
     }
 
     /// Returns a publisher that emits the active device ID on every cluster update.
@@ -794,13 +741,31 @@ enum SpotifyPlayer {
         spotifly_is_session_connected() == 1
     }
 
-    /// Forces a reconnection to Spotify servers.
-    /// Use this after system wake to ensure a fresh connection before playback.
-    /// Returns true if reconnection was triggered, false if already reconnecting or no session.
+    /// Outcome of a force-reconnect request.
+    ///
+    /// `alreadyRecovering` and `noSession` both mean "nothing was started", but they need
+    /// opposite responses: the first is fine to ignore because recovery is already under
+    /// way, while the second means there is nothing to reconnect *to* and only a full
+    /// rebuild will help. Collapsing them into one `false` is how a wake could end up
+    /// doing nothing at all.
+    enum ForceReconnectOutcome {
+        case started
+        case alreadyRecovering
+        case noSession
+    }
+
+    /// Asks Rust to reconnect, without tearing down what it already has.
+    ///
+    /// Preferred over `PlaybackViewModel.forceReinitialize` wherever a session may exist:
+    /// reinitialize runs a destructive cleanup first, which invalidates any reconnect loop
+    /// currently working the problem.
     @discardableResult
-    static func forceReconnect() -> Bool {
-        let result = spotifly_force_reconnect()
-        return result == 0
+    static func forceReconnect() -> ForceReconnectOutcome {
+        switch spotifly_force_reconnect() {
+        case 0: .started
+        case 1: .alreadyRecovering
+        default: .noSession
+        }
     }
 
     /// Returns a publisher for connection state updates.
@@ -811,28 +776,21 @@ enum SpotifyPlayer {
 
     /// Returns the current connection state synchronously.
     /// Use this for initial UI display or one-time queries.
+    ///
+    /// Rust stamps a pull with a revision just as it does a push, so the result is published
+    /// like any other snapshot. Without that, a callback already queued behind this call
+    /// would still look newer than the last delivered snapshot and overwrite what was just
+    /// read — and suppressing it instead would leave the subject holding the older value.
     static func getConnectionState() -> LibrespotConnectionState? {
         let ptr = spotifly_get_connection_state()
-        guard ptr != nil else { return nil }
+        guard let ptr else { return nil }
         defer { spotifly_free_string(ptr) }
 
-        let jsonString = String(cString: ptr!)
-        guard let data = jsonString.data(using: String.Encoding.utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
+        guard let state = decodeConnectionState(ptr, context: "getConnectionState") else {
             return nil
         }
-
-        return LibrespotConnectionState(
-            sessionConnected: json["session_connected"] as? Bool ?? false,
-            sessionConnectionId: json["session_connection_id"] as? String,
-            spircReady: json["spirc_ready"] as? Bool ?? false,
-            deviceId: json["device_id"] as? String,
-            deviceName: json["device_name"] as? String ?? "Spotifly",
-            reconnectAttempt: (json["reconnect_attempt"] as? NSNumber)?.uint32Value ?? 0,
-            lastError: json["last_error"] as? String,
-            connectedSinceMs: (json["connected_since_ms"] as? NSNumber)?.uint64Value,
-        )
+        deliverConnectionState(state)
+        return state
     }
 
     /// Syncs playback settings from UserDefaults to the Rust player
@@ -942,10 +900,32 @@ enum SpotifyPlayer {
     /// Shuts down the Spirc connection and sends goodbye to other devices.
     /// Call this when the app is quitting to properly disconnect from Spotify Connect.
     /// Dispatched to background thread to avoid blocking the main thread.
-    static func shutdown() {
-        Task.detached(priority: .userInitiated) {
-            spotifly_shutdown()
-        }
+    ///
+    /// Awaitable so callers can order it against a rebuild of the same global player. The
+    /// Rust side only hands Spirc a shutdown command, so awaiting costs nothing.
+    ///
+    /// `nonisolated` matters at app termination: the project builds with
+    /// `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, so a main-actor-isolated version could
+    /// not start until `applicationWillTerminate` returned — by which point AppKit may
+    /// already have torn the process down.
+    nonisolated static func shutdown() async {
+        await Task.detached(priority: .userInitiated) {
+            _ = spotifly_shutdown()
+        }.value
+    }
+
+    /// Says goodbye to other Connect devices, then releases the whole Rust session.
+    ///
+    /// `shutdown()` alone only disconnects Spirc — Session, Player and Mixer keep running
+    /// with the credentials of the account that just logged out, and would only be released
+    /// by the cleanup at the *next* login. The cleanup also invalidates the session
+    /// generation, so an initialization still in flight abandons instead of rebuilding for
+    /// an account that is gone.
+    nonisolated static func shutdownAndCleanup() async {
+        await Task.detached(priority: .userInitiated) {
+            _ = spotifly_shutdown()
+            spotifly_cleanup()
+        }.value
     }
 
     /// Disconnects from Spotify Connect without preventing future reconnection.
@@ -1032,8 +1012,12 @@ enum SpotifyPlayer {
     /// special-cased to true mute / unity, matching librespot.
     private nonisolated static func librespotLogAttenuation(_ volume: Double) -> Double {
         let v = max(0, min(1, volume))
-        if v <= 0 { return 0 }
-        if v >= 1 { return 1 }
+        if v <= 0 {
+            return 0
+        }
+        if v >= 1 {
+            return 1
+        }
         let dbRatio = 1000.0
         return exp(log(dbRatio) * v) / dbRatio
     }
@@ -1057,25 +1041,30 @@ enum SpotifyPlayer {
         }
     }
 
+    /// Runs an FFI command off the main thread and reports whether Rust accepted it.
+    ///
+    /// Only used by the paths that change presentation state on the strength of a
+    /// command succeeding. Commands whose rejection has no visible consequence stay
+    /// fire-and-forget rather than growing a result-handling path for nothing.
+    private static func runCommand(
+        _ body: @escaping @Sendable () -> SpotiflyResult,
+    ) async -> Bool {
+        await Task.detached(priority: .userInitiated) { body() == .ok }.value
+    }
+
     /// Transfers playback from another Spotify Connect device to this local player.
     /// Uses the native Spotify Connect protocol via Spirc for seamless handoff.
-    /// Dispatched to background thread to avoid blocking the main thread.
-    static func transferToLocal() {
-        Task.detached(priority: .userInitiated) {
-            spotifly_transfer_to_local()
-        }
+    /// - Returns: `true` if Rust accepted the transfer.
+    static func transferToLocal() async -> Bool {
+        await runCommand { spotifly_transfer_to_local() }
     }
 
     /// Transfers playback from this local player to another device.
     /// Uses the native Spotify Connect protocol via SpClient for seamless handoff.
-    /// Dispatched to background thread to avoid blocking the main thread.
     /// - Parameter deviceId: The target device ID to transfer playback to
-    static func transferPlayback(to deviceId: String) {
-        Task.detached(priority: .userInitiated) {
-            _ = deviceId.withCString { ptr in
-                spotifly_transfer_playback(ptr)
-            }
-        }
+    /// - Returns: `true` if Rust accepted the transfer.
+    static func transferPlayback(to deviceId: String) async -> Bool {
+        await runCommand { deviceId.withCString { spotifly_transfer_playback($0) } }
     }
 
     /// Adds an item to the queue via Spirc.

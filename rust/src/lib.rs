@@ -10,9 +10,9 @@ use librespot_core::SpotifyUri;
 use librespot_playback::config::{AudioFormat, Bitrate, PlayerConfig};
 use librespot_playback::mixer::softmixer::SoftMixer;
 use librespot_playback::mixer::{Mixer, MixerConfig, NoOpVolume};
-use librespot_playback::player::{Player, PlayerEvent};
+use librespot_playback::player::{Player, PlayerEvent, QueueTrack};
 use librespot_protocol::connect::ClusterUpdate;
-use librespot_protocol::player::PlayerState;
+use librespot_protocol::player::{PlayerState, ProvidedTrack};
 use log::debug;
 use once_cell::sync::Lazy;
 use proxy_sink::mk_proxy_sink;
@@ -37,10 +37,7 @@ static PLAYER: Lazy<Mutex<Option<Arc<Player>>>> = Lazy::new(|| Mutex::new(None))
 static SESSION: Lazy<Mutex<Option<Session>>> = Lazy::new(|| Mutex::new(None));
 static MIXER: Lazy<Mutex<Option<Arc<SoftMixer>>>> = Lazy::new(|| Mutex::new(None));
 static SPIRC: Lazy<Mutex<Option<Arc<Spirc>>>> = Lazy::new(|| Mutex::new(None));
-static DEVICE_ID: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 static IS_PLAYING: AtomicBool = AtomicBool::new(false);
-static SPIRC_READY: AtomicBool = AtomicBool::new(false);
-static IS_ACTIVE_DEVICE: AtomicBool = AtomicBool::new(false);
 static PLAYING_EVENT_SEQ: AtomicU64 = AtomicU64::new(0);
 static PLAYER_EVENT_TX: Lazy<Mutex<Option<mpsc::UnboundedSender<()>>>> =
     Lazy::new(|| Mutex::new(None));
@@ -48,15 +45,14 @@ static QUEUE_CALLBACK: Lazy<Mutex<Option<extern "C" fn(*const c_char)>>> =
     Lazy::new(|| Mutex::new(None));
 static PLAYBACK_STATE_CALLBACK: Lazy<Mutex<Option<extern "C" fn(*const c_char)>>> =
     Lazy::new(|| Mutex::new(None));
-static STATE_UPDATE_CALLBACK: Lazy<Mutex<Option<extern "C" fn()>>> = Lazy::new(|| Mutex::new(None));
 static VOLUME_CALLBACK: Lazy<Mutex<Option<extern "C" fn(u16)>>> = Lazy::new(|| Mutex::new(None));
 static LOADING_CALLBACK: Lazy<Mutex<Option<extern "C" fn(*const c_char)>>> =
     Lazy::new(|| Mutex::new(None));
 static QUEUE_CHANGED_CALLBACK: Lazy<Mutex<Option<extern "C" fn(*const c_char)>>> =
     Lazy::new(|| Mutex::new(None));
-static SESSION_DISCONNECTED_CALLBACK: Lazy<Mutex<Option<extern "C" fn()>>> =
+static BECAME_INACTIVE_CALLBACK: Lazy<Mutex<Option<extern "C" fn()>>> =
     Lazy::new(|| Mutex::new(None));
-static SESSION_CONNECTED_CALLBACK: Lazy<Mutex<Option<extern "C" fn()>>> =
+static BECAME_ACTIVE_CALLBACK: Lazy<Mutex<Option<extern "C" fn()>>> =
     Lazy::new(|| Mutex::new(None));
 static SESSION_CLIENT_CHANGED_CALLBACK: Lazy<Mutex<Option<extern "C" fn(*const c_char)>>> =
     Lazy::new(|| Mutex::new(None));
@@ -65,6 +61,9 @@ static SET_QUEUE_CALLBACK: Lazy<Mutex<Option<extern "C" fn(*const c_char)>>> =
 static ACTIVE_DEVICE_CALLBACK: Lazy<Mutex<Option<extern "C" fn(*const c_char)>>> =
     Lazy::new(|| Mutex::new(None));
 static LAST_ACTIVE_DEVICE_ID: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
+/// Serializes snapshot building so a revision always orders snapshots by the state they
+/// actually saw. Held only across the build, never across delivery into Swift.
+static SNAPSHOT_REVISION: Mutex<u64> = Mutex::new(0);
 static LAST_VOLUME: AtomicU16 = AtomicU16::new(0);
 static SHUFFLE_STATE: AtomicBool = AtomicBool::new(false);
 static REPEAT_TRACK_STATE: AtomicBool = AtomicBool::new(false);
@@ -83,31 +82,187 @@ static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 // Flag to track sleep state (prevents auto-reconnect, but allows explicit forceReconnect on wake)
 static SLEEPING: AtomicBool = AtomicBool::new(false);
 
-// Auto-resume after reconnection: if non-zero, resume playback when Paused event arrives before this timestamp
-// This handles the case where we were playing before a network disconnect, reconnected, but track loaded paused
-static RESUME_AFTER_RECONNECT_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
-
-// Session state tracking - guards playback commands until session is ready
-struct SessionConnectionState {
-    connection_id: Option<String>,
-    is_connected: bool,
+/// Everything the connection snapshot publishes, behind a single lock.
+///
+/// These fields used to live in six independent globals (three mutexes and three
+/// atomics), so a snapshot assembled from them could mix values from different
+/// transitions — ready from one, connection metadata from another. Keeping them
+/// together makes every published snapshot internally consistent by construction.
+///
+/// `connected_since_ms` uses 0 for "never connected"; the wire format maps that to null.
+///
+/// `is_active_device` also lives here rather than in a separate atomic. It used to be
+/// tracked in `IS_ACTIVE_DEVICE`, written from fourteen scattered command and event sites
+/// and never reconciled against the cluster, while Swift separately tracked activity from
+/// the active-device-id callback — so playback routing and the UI could disagree about
+/// whether Spotifly or a remote speaker was active.
+#[derive(Default, Clone)]
+struct ConnectionState {
+    session_connected: bool,
+    session_connection_id: Option<String>,
+    spirc_ready: bool,
+    device_id: Option<String>,
+    reconnect_attempt: u32,
+    last_error: Option<String>,
+    connected_since_ms: u64,
+    is_active_device: bool,
 }
 
-impl Default for SessionConnectionState {
-    fn default() -> Self {
+/// Derives whether this device is the active one from a cluster update.
+///
+/// An empty active-device ID means nothing is active anywhere. That is a real state and
+/// must clear activity rather than be ignored, otherwise the last active device stays
+/// displayed forever once playback stops.
+fn is_active_in_cluster(active_device_id: &str, own_device_id: Option<&str>) -> bool {
+    !active_device_id.is_empty() && own_device_id == Some(active_device_id)
+}
+
+/// Whether an intentional teardown is under way. Recovery must never fight one.
+fn teardown_in_progress() -> bool {
+    SHUTTING_DOWN.load(Ordering::SeqCst) || SLEEPING.load(Ordering::SeqCst)
+}
+
+/// Whether losing the active Connect role should start network recovery.
+///
+/// Deactivation is normally just a handoff to another device and must not reconnect. The
+/// one case that must is a Session that has gone invalid: librespot calls
+/// `handle_disconnect` on unexpected Spirc shutdown, and the cluster listener can miss
+/// that while the dealer stream is still open.
+fn should_recover_after_deactivation(session_invalid: bool, teardown_in_progress: bool) -> bool {
+    session_invalid && !teardown_in_progress
+}
+
+/// What playback looked like when recovery was decided on.
+///
+/// Captured at the trigger rather than inside the reconnect task. Between those two points
+/// the deactivation handler clears the active flag, a `Stopped` event clears `IS_PLAYING`,
+/// and a final cluster update can clear both — so reading it late made "does an outage
+/// resume playback" depend on event ordering rather than on what was actually playing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecoveryIntent {
+    was_playing: bool,
+    was_active: bool,
+}
+
+impl RecoveryIntent {
+    /// Reads what is playing right now. Call this before touching playback state.
+    fn capture() -> Self {
         Self {
-            connection_id: None,
-            is_connected: false,
+            was_playing: IS_PLAYING.load(Ordering::SeqCst),
+            was_active: is_active_device(),
         }
+    }
+
+    /// Only local playback is rehydrated. If another device was playing, it still is, and
+    /// taking over would steal it from the user.
+    fn should_resume(self) -> bool {
+        self.was_playing && self.was_active
     }
 }
 
-static SESSION_CONNECTION_STATE: Lazy<Mutex<SessionConnectionState>> =
-    Lazy::new(|| Mutex::new(SessionConnectionState::default()));
+/// Whether the periodic health check should start recovery.
+///
+/// Invalidity alone is not a sufficient trigger. `Session::is_invalid` is only set by
+/// `shutdown()`, so a session that was created but never managed to connect — exactly what
+/// a failed `init_player_async` leaves behind — reports itself valid forever. The state
+/// that actually needs rescuing is "not connected and nobody is recovering", however it was
+/// reached: a session that died, or one that never came up.
+///
+/// The reconnect check matters because the loop is the thing that fixes this; firing while
+/// it is already running would only re-publish a disconnected snapshot once a minute.
+fn health_check_should_recover(
+    session_invalid: bool,
+    session_connected: bool,
+    reconnect_in_progress: bool,
+    teardown_in_progress: bool,
+) -> bool {
+    !teardown_in_progress && !reconnect_in_progress && (session_invalid || !session_connected)
+}
+
+/// Whether a listener may act on an event, given the generation it was created for.
+///
+/// A superseded listener drains asynchronously after its replacement is installed, so it
+/// can still deliver events belonging to a session that no longer exists.
+fn listener_may_act(listener_generation: u64, current_generation: u64) -> bool {
+    listener_generation == current_generation
+}
+
+/// Whether a reconnect loop may still rebuild, given the generation it set out to recover.
+///
+/// The loop sleeps up to 30 seconds between attempts. A manual restart or a teardown in
+/// that window means the thing it is fixing is gone, and rebuilding would clobber whatever
+/// replaced it.
+fn reconnect_may_proceed(
+    recovering_generation: u64,
+    current_generation: u64,
+    teardown_in_progress: bool,
+) -> bool {
+    recovering_generation == current_generation && !teardown_in_progress
+}
+
+/// Whether a cluster listener that ended should start network recovery.
+///
+/// Only the listener belonging to the current session generation may act. An older
+/// listener ending is the expected consequence of the session it belonged to being
+/// replaced, not evidence of a transport failure — acting on it would reconnect a session
+/// that is already healthy.
+fn should_recover_after_cluster_end(
+    listener_generation: u64,
+    current_generation: u64,
+    teardown_in_progress: bool,
+) -> bool {
+    listener_generation == current_generation && !teardown_in_progress
+}
+
+/// Whether this device is currently the active Spotify Connect device.
+fn is_active_device() -> bool {
+    with_connection(|c| c.is_active_device)
+}
+
+/// Records whether this device is the active one, publishing the change if it moved.
+fn set_active_device(active: bool) {
+    if store_active_device(active) {
+        notify_connection_state_change();
+    }
+}
+
+/// Records activity without publishing, returning whether it changed.
+///
+/// For callers that are mid-transition and will publish once when they are done —
+/// `init_player_async` still has to rehydrate after activating, and publishing in between
+/// is what let Swift bootstrap against a half-built session.
+fn store_active_device(active: bool) -> bool {
+    let changed = with_connection(|c| {
+        let changed = c.is_active_device != active;
+        c.is_active_device = active;
+        changed
+    });
+    if changed {
+        debug!("Active device changed: is_active={}", active);
+    }
+    changed
+}
+
+static CONNECTION: Lazy<Mutex<ConnectionState>> =
+    Lazy::new(|| Mutex::new(ConnectionState::default()));
+
+/// Mutates the connection state under its lock and returns whatever `f` returns.
+///
+/// Does not publish — callers decide when to `notify_connection_state_change()`, so a
+/// multi-field transition emits one snapshot rather than one per field. Never call
+/// `notify_connection_state_change()` from inside `f`: it locks `CONNECTION` too.
+fn with_connection<R>(f: impl FnOnce(&mut ConnectionState) -> R) -> R {
+    let mut state = CONNECTION.lock().unwrap();
+    f(&mut state)
+}
+
+/// Returns the device ID assigned at session creation, if a session has been built.
+fn current_device_id() -> Option<String> {
+    with_connection(|c| c.device_id.clone())
+}
 
 // Position tracking - updated from player events
 static POSITION_MS: AtomicU32 = AtomicU32::new(0);
-static POSITION_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
 
 // Current track duration (ms) - updated from TrackChanged event
 static CURRENT_DURATION_MS: AtomicU32 = AtomicU32::new(0);
@@ -115,32 +270,12 @@ static CURRENT_DURATION_MS: AtomicU32 = AtomicU32::new(0);
 // Current track URI - for detecting same-track reconnects
 static CURRENT_TRACK_URI: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 
-// Pending play - tracks an in-flight play command so the soft-reconnect watchdog can retry
-// it if the audio key fetch on the old session times out.
-// Cleared on: PlayerEvent::Playing (success), spotifly_stop/disconnect/shutdown/cleanup (canceled).
-// A new play command supersedes any previous one via a monotonically increasing request_id.
-#[derive(Clone)]
-enum PendingPlayRequest {
-    Uri(String, i32),  // (uri, track_index)
-    Tracks(String),    // track_uris_json
-    Radio(String),     // seed_track_uri — re-resolves playlist and seeks to seed on retry
-}
-#[derive(Clone)]
-struct PendingPlay {
-    request_id: u64,
-    request: PendingPlayRequest,
-}
-static PENDING_PLAY: Lazy<Mutex<Option<PendingPlay>>> = Lazy::new(|| Mutex::new(None));
-static PENDING_PLAY_SEQ: AtomicU64 = AtomicU64::new(0);
-
 // Current context URI - captured from SetQueue and cluster player state updates.
 // We keep the latest non-empty value to recover resume after reconnect.
 static CURRENT_CONTEXT_URI: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 
-// Connection state tracking - for transparency dashboard
-static RECONNECT_ATTEMPT: AtomicU32 = AtomicU32::new(0);
-static CONNECTED_SINCE_MS: AtomicU64 = AtomicU64::new(0);
-static LAST_ERROR: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
+// Connection state tracking - for transparency dashboard. See ConnectionState above;
+// reconnect attempt, connected-since, and last error all live there now.
 static CONNECTION_STATE_CALLBACK: Lazy<Mutex<Option<extern "C" fn(*const c_char)>>> =
     Lazy::new(|| Mutex::new(None));
 
@@ -158,14 +293,21 @@ fn elapsed_since_wake_ms() -> u64 {
     now.saturating_sub(wake_ts)
 }
 
-// Generation counter for reconnection - prevents old cluster listeners from triggering reconnects
-// Incremented each time a new session is created (in spawn_reconnection_loop or init_player)
+// Generation counter for reconnection. Bumped once per rebuild, in init_player_async, and
+// captured by every listener that rebuild creates. A listener whose captured generation no
+// longer matches belongs to a session that has already been replaced, and must not act.
+//
+// There used to be a second global, EVENT_LISTENER_GENERATION, holding "the generation the
+// current event listener belongs to". Soft reconnect kept one listener alive across
+// sessions, so the listener could not simply capture its generation — and the global was
+// written to the new value on every bump, which made the two always equal and the staleness
+// check unreachable. Now that a rebuild replaces the listener along with its session, the
+// listener captures the value directly and the check does what it claims.
 static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
-
-// The generation that the current event listener belongs to. Updated on soft reconnect
-// so the existing event listener accepts SessionDisconnected events from the new session.
-// On hard reconnect, a new event listener is created that captures SESSION_GENERATION directly.
-static EVENT_LISTENER_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Generation created by the most recent `build_player_async`. Lets the reconnect loop adopt
+/// the generation its own attempt made rather than whatever the counter reads afterwards,
+/// which may belong to a logout and the login that followed it.
+static LAST_BUILD_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 // Playback settings (applied on player init)
 // Bitrate: 0 = 96kbps, 1 = 160kbps (default), 2 = 320kbps
@@ -230,6 +372,9 @@ struct QueueTrackInfo {
 
 #[derive(Serialize)]
 struct ConnectionStateInfo {
+    /// Monotonic, assigned while the snapshot is built. Lets Swift discard a snapshot that
+    /// reaches the main actor after a newer one — see `handleConnectionStateCallback`.
+    revision: u64,
     session_connected: bool,
     session_connection_id: Option<String>,
     spirc_ready: bool,
@@ -238,6 +383,7 @@ struct ConnectionStateInfo {
     reconnect_attempt: u32,
     last_error: Option<String>,
     connected_since_ms: Option<u64>,
+    is_active_device: bool,
 }
 
 #[derive(Serialize)]
@@ -259,7 +405,6 @@ fn current_timestamp_ms() -> u64 {
 /// Update position from player event
 fn update_position(position_ms: u32) {
     POSITION_MS.store(position_ms, Ordering::SeqCst);
-    POSITION_TIMESTAMP_MS.store(current_timestamp_ms(), Ordering::SeqCst);
 }
 
 fn update_current_context_uri(context_uri: &str) {
@@ -268,15 +413,6 @@ fn update_current_context_uri(context_uri: &str) {
     }
     let mut context_guard = CURRENT_CONTEXT_URI.lock().unwrap();
     *context_guard = Some(context_uri.to_string());
-}
-
-fn set_pending_play(request: PendingPlayRequest) {
-    let request_id = PENDING_PLAY_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
-    *PENDING_PLAY.lock().unwrap() = Some(PendingPlay { request_id, request });
-}
-
-fn clear_pending_play() {
-    *PENDING_PLAY.lock().unwrap() = None;
 }
 
 fn update_playback_options(shuffle: bool, repeat_track: bool, repeat_context: bool) {
@@ -336,6 +472,69 @@ fn parse_spotify_uri(uri_str: &str) -> Result<SpotifyUri, String> {
     SpotifyUri::from_uri(uri_str).map_err(|e| format!("Invalid Spotify URI: {:?}", e))
 }
 
+/// Copies a C string argument into an owned `String`, or `None` if it is null or not UTF-8.
+///
+/// # Safety
+/// `ptr` must be null or point to a valid NUL-terminated C string.
+unsafe fn c_string_arg(ptr: *const c_char) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let c_str = unsafe { CStr::from_ptr(ptr) };
+    c_str.to_str().ok().map(str::to_owned)
+}
+
+/// Copies a registered callback out of its slot, releasing the slot lock before returning.
+///
+/// No callback may run with its slot lock held: it re-enters Swift, which can call straight
+/// back into Rust. Taking the pointer out here makes that structural instead of a
+/// `drop(guard)` that every call site has to remember.
+fn registered_callback<F: Copy>(slot: &Mutex<Option<F>>) -> Option<F> {
+    *slot.lock().unwrap()
+}
+
+/// Serializes `payload` and hands it to a Swift callback as a C string.
+///
+/// The C string outlives the call and is freed on return: Swift copies what it needs
+/// before the callback returns.
+fn send_json<T: Serialize>(callback: extern "C" fn(*const c_char), payload: &T) {
+    match serde_json::to_string(payload) {
+        Ok(json) => {
+            let c_str = CString::new(json).unwrap();
+            callback(c_str.as_ptr());
+        }
+        Err(e) => debug!("Failed to serialize callback payload: {:?}", e),
+    }
+}
+
+/// Runs a command against the current Spirc and maps the outcome to an FFI error code.
+///
+/// `what` names the command in the error logs. A closed channel is reported separately
+/// (`ERROR_NEEDS_REINIT`) because Swift responds to it by rebuilding the player rather
+/// than by surfacing a failure.
+fn spirc_command(
+    what: &str,
+    command: impl FnOnce(&Spirc) -> Result<(), librespot_core::Error>,
+) -> i32 {
+    let spirc_guard = SPIRC.lock().unwrap();
+    let Some(spirc) = spirc_guard.as_ref() else {
+        debug!("{} error: Spirc not initialized", what);
+        return ERROR_GENERAL;
+    };
+
+    match command(spirc) {
+        Ok(()) => 0,
+        Err(e) => {
+            debug!("{} error: {:?}", what, e);
+            if is_channel_closed_error(&e) {
+                ERROR_NEEDS_REINIT
+            } else {
+                ERROR_GENERAL
+            }
+        }
+    }
+}
+
 /// Shuts down the Spirc instance if it exists.
 /// This terminates the spirc_task and closes the dealer connection.
 fn shutdown_spirc(context: &str) {
@@ -362,8 +561,7 @@ pub extern "C" fn spotifly_free_string(s: *mut c_char) {
 /// Registers a callback to receive queue updates (as JSON string).
 #[no_mangle]
 pub extern "C" fn spotifly_register_queue_callback(callback: extern "C" fn(*const c_char)) {
-    let mut cb = QUEUE_CALLBACK.lock().unwrap();
-    *cb = Some(callback);
+    *QUEUE_CALLBACK.lock().unwrap() = Some(callback);
 }
 
 /// Registers a callback to receive playback state updates (as JSON string).
@@ -371,16 +569,7 @@ pub extern "C" fn spotifly_register_queue_callback(callback: extern "C" fn(*cons
 pub extern "C" fn spotifly_register_playback_state_callback(
     callback: extern "C" fn(*const c_char),
 ) {
-    let mut cb = PLAYBACK_STATE_CALLBACK.lock().unwrap();
-    *cb = Some(callback);
-}
-
-/// Registers a callback to receive state update notifications.
-/// This fires on track changes to signal Swift to fetch updated queue state.
-#[no_mangle]
-pub extern "C" fn spotifly_register_state_update_callback(callback: extern "C" fn()) {
-    let mut cb = STATE_UPDATE_CALLBACK.lock().unwrap();
-    *cb = Some(callback);
+    *PLAYBACK_STATE_CALLBACK.lock().unwrap() = Some(callback);
 }
 
 /// Registers a callback to receive volume change notifications.
@@ -388,8 +577,7 @@ pub extern "C" fn spotifly_register_state_update_callback(callback: extern "C" f
 /// The callback receives the new volume (0-65535).
 #[no_mangle]
 pub extern "C" fn spotifly_register_volume_callback(callback: extern "C" fn(u16)) {
-    let mut cb = VOLUME_CALLBACK.lock().unwrap();
-    *cb = Some(callback);
+    *VOLUME_CALLBACK.lock().unwrap() = Some(callback);
 }
 
 /// Registers a callback to receive loading notifications.
@@ -398,8 +586,7 @@ pub extern "C" fn spotifly_register_volume_callback(callback: extern "C" fn(u16)
 /// The callback receives JSON with track_uri and position_ms.
 #[no_mangle]
 pub extern "C" fn spotifly_register_loading_callback(callback: extern "C" fn(*const c_char)) {
-    let mut cb = LOADING_CALLBACK.lock().unwrap();
-    *cb = Some(callback);
+    *LOADING_CALLBACK.lock().unwrap() = Some(callback);
 }
 
 /// Registers a callback to receive queue change notifications.
@@ -407,26 +594,27 @@ pub extern "C" fn spotifly_register_loading_callback(callback: extern "C" fn(*co
 /// The callback receives JSON with track_uri.
 #[no_mangle]
 pub extern "C" fn spotifly_register_queue_changed_callback(callback: extern "C" fn(*const c_char)) {
-    let mut cb = QUEUE_CHANGED_CALLBACK.lock().unwrap();
-    *cb = Some(callback);
+    *QUEUE_CHANGED_CALLBACK.lock().unwrap() = Some(callback);
 }
 
-/// Registers a callback to receive session disconnection notifications.
-/// Called when the Spotify session is disconnected (e.g., idle timeout).
-/// When this fires, you should reinitialize the player with a fresh token.
+/// Registers a callback fired when this device stops being the active Connect device.
+///
+/// This is an activity notification, not a health one: it fires on an explicit
+/// disconnect, on shutdown, and whenever another device takes over playback. Do not
+/// treat it as a connection failure - read the connection snapshot for that.
 #[no_mangle]
-pub extern "C" fn spotifly_register_session_disconnected_callback(callback: extern "C" fn()) {
-    let mut cb = SESSION_DISCONNECTED_CALLBACK.lock().unwrap();
-    *cb = Some(callback);
+pub extern "C" fn spotifly_register_became_inactive_callback(callback: extern "C" fn()) {
+    *BECAME_INACTIVE_CALLBACK.lock().unwrap() = Some(callback);
 }
 
-/// Registers a callback to receive session connection notifications.
-/// Called when the Spotify session is fully connected and ready for commands.
-/// Wait for this callback before attempting playback operations after init/reinit.
+/// Registers a callback fired when this device becomes the active Connect device.
+///
+/// Also an activity notification: the session was already connected beforehand, so this
+/// says nothing about readiness. Use the connection snapshot to decide when commands
+/// can be sent.
 #[no_mangle]
-pub extern "C" fn spotifly_register_session_connected_callback(callback: extern "C" fn()) {
-    let mut cb = SESSION_CONNECTED_CALLBACK.lock().unwrap();
-    *cb = Some(callback);
+pub extern "C" fn spotifly_register_became_active_callback(callback: extern "C" fn()) {
+    *BECAME_ACTIVE_CALLBACK.lock().unwrap() = Some(callback);
 }
 
 /// Registers a callback to receive session client changed notifications.
@@ -434,8 +622,7 @@ pub extern "C" fn spotifly_register_session_connected_callback(callback: extern 
 pub extern "C" fn spotifly_register_session_client_changed_callback(
     callback: extern "C" fn(*const c_char),
 ) {
-    let mut cb = SESSION_CLIENT_CHANGED_CALLBACK.lock().unwrap();
-    *cb = Some(callback);
+    *SESSION_CLIENT_CHANGED_CALLBACK.lock().unwrap() = Some(callback);
 }
 
 /// Registers a callback to receive set queue notifications.
@@ -443,16 +630,14 @@ pub extern "C" fn spotifly_register_session_client_changed_callback(
 /// The callback receives JSON with next_tracks and prev_tracks arrays containing uri and provider.
 #[no_mangle]
 pub extern "C" fn spotifly_register_set_queue_callback(callback: extern "C" fn(*const c_char)) {
-    let mut cb = SET_QUEUE_CALLBACK.lock().unwrap();
-    *cb = Some(callback);
+    *SET_QUEUE_CALLBACK.lock().unwrap() = Some(callback);
 }
 
 /// Registers a callback to receive active device ID changes from cluster updates.
 /// Called on every cluster update with the current active device ID string.
 #[no_mangle]
 pub extern "C" fn spotifly_register_active_device_callback(callback: extern "C" fn(*const c_char)) {
-    let mut cb = ACTIVE_DEVICE_CALLBACK.lock().unwrap();
-    *cb = Some(callback);
+    *ACTIVE_DEVICE_CALLBACK.lock().unwrap() = Some(callback);
 }
 
 /// Registers a callback for token requests during reconnection.
@@ -460,8 +645,7 @@ pub extern "C" fn spotifly_register_active_device_callback(callback: extern "C" 
 /// Swift should respond by calling spotifly_set_token() with a fresh access token.
 #[no_mangle]
 pub extern "C" fn spotifly_register_token_request_callback(callback: extern "C" fn()) {
-    let mut cb = TOKEN_REQUEST_CALLBACK.lock().unwrap();
-    *cb = Some(callback);
+    *TOKEN_REQUEST_CALLBACK.lock().unwrap() = Some(callback);
 }
 
 /// Provides a fresh access token for reconnection.
@@ -469,19 +653,9 @@ pub extern "C" fn spotifly_register_token_request_callback(callback: extern "C" 
 /// The token is passed to the pending reconnection attempt.
 #[no_mangle]
 pub extern "C" fn spotifly_set_token(token: *const c_char) {
-    if token.is_null() {
-        debug!("spotifly_set_token: token is null");
+    let Some(token_str) = (unsafe { c_string_arg(token) }) else {
+        debug!("spotifly_set_token: token is null or not valid UTF-8");
         return;
-    }
-
-    let token_str = unsafe {
-        match CStr::from_ptr(token).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                debug!("spotifly_set_token: invalid token string");
-                return;
-            }
-        }
     };
 
     debug!(
@@ -507,8 +681,7 @@ pub extern "C" fn spotifly_set_token(token: *const c_char) {
 pub extern "C" fn spotifly_register_connection_state_callback(
     callback: extern "C" fn(*const c_char),
 ) {
-    let mut cb = CONNECTION_STATE_CALLBACK.lock().unwrap();
-    *cb = Some(callback);
+    *CONNECTION_STATE_CALLBACK.lock().unwrap() = Some(callback);
 }
 
 /// Registers a callback to receive raw PCM audio data (f32, 44100Hz, stereo interleaved).
@@ -540,51 +713,49 @@ pub extern "C" fn spotifly_get_connection_state() -> *mut c_char {
     }
 }
 
-/// Builds the current connection state info struct
+/// Builds the current connection state info struct, stamped with a fresh revision.
+///
+/// Reading the state and assigning the revision happen together, so two concurrent
+/// publishers cannot end up with revisions that contradict the order they read state in.
+/// Delivery is deliberately left outside: `send_json` re-enters Swift, which must never
+/// happen while a lock is held.
 fn build_connection_state_info() -> ConnectionStateInfo {
-    let session_state = SESSION_CONNECTION_STATE.lock().unwrap();
-    let device_id = DEVICE_ID.lock().unwrap().clone();
-    let last_error = LAST_ERROR.lock().unwrap().clone();
-    let connected_since = CONNECTED_SINCE_MS.load(Ordering::SeqCst);
+    let mut revision = SNAPSHOT_REVISION.lock().unwrap();
+    *revision += 1;
+    let state = with_connection(|c| c.clone());
 
     ConnectionStateInfo {
-        session_connected: session_state.is_connected,
-        session_connection_id: session_state.connection_id.clone(),
-        spirc_ready: SPIRC_READY.load(Ordering::SeqCst),
-        device_id,
+        revision: *revision,
+        session_connected: state.session_connected,
+        session_connection_id: state.session_connection_id,
+        spirc_ready: state.spirc_ready,
+        device_id: state.device_id,
         device_name: "Spotifly".to_string(),
-        reconnect_attempt: RECONNECT_ATTEMPT.load(Ordering::SeqCst),
-        last_error,
-        connected_since_ms: if connected_since > 0 {
-            Some(connected_since)
-        } else {
-            None
-        },
+        reconnect_attempt: state.reconnect_attempt,
+        last_error: state.last_error,
+        connected_since_ms: (state.connected_since_ms > 0).then_some(state.connected_since_ms),
+        is_active_device: state.is_active_device,
     }
 }
 
 /// Marks the session as disconnected, records the reason, and notifies the UI.
 fn mark_disconnected(reason: &str) {
-    {
-        let mut state = SESSION_CONNECTION_STATE.lock().unwrap();
-        state.is_connected = false;
-        state.connection_id = None;
-    }
-    CONNECTED_SINCE_MS.store(0, Ordering::SeqCst);
-    {
-        let mut last_error = LAST_ERROR.lock().unwrap();
-        *last_error = Some(reason.to_string());
-    }
+    with_connection(|c| {
+        c.session_connected = false;
+        c.session_connection_id = None;
+        c.connected_since_ms = 0;
+        c.last_error = Some(reason.to_string());
+    });
     notify_connection_state_change();
 }
 
 /// Sends the active device ID to the registered callback if it changed since the last update.
 /// Called on every cluster update — deduplicates so Swift only sees actual changes.
+///
+/// An empty ID means "no device is active" and is forwarded as such. It used to be
+/// dropped, which left Swift showing the previous active device forever once playback
+/// stopped everywhere.
 fn notify_active_device_id(device_id: &str) {
-    if device_id.is_empty() {
-        return;
-    }
-
     // Only notify if the active device actually changed
     let mut last = LAST_ACTIVE_DEVICE_ID.lock().unwrap();
     if *last == device_id {
@@ -593,28 +764,17 @@ fn notify_active_device_id(device_id: &str) {
     *last = device_id.to_string();
     drop(last);
 
-    let cb_guard = ACTIVE_DEVICE_CALLBACK.lock().unwrap();
-    if let Some(callback) = *cb_guard {
-        let cb = callback;
-        drop(cb_guard);
+    if let Some(callback) = registered_callback(&ACTIVE_DEVICE_CALLBACK) {
         if let Ok(c_str) = CString::new(device_id) {
-            cb(c_str.as_ptr());
+            callback(c_str.as_ptr());
         }
     }
 }
 
 /// Sends connection state update to the registered callback
 fn notify_connection_state_change() {
-    let cb_guard = CONNECTION_STATE_CALLBACK.lock().unwrap();
-    if let Some(callback) = *cb_guard {
-        let cb = callback;
-        drop(cb_guard);
-
-        let state = build_connection_state_info();
-        if let Ok(json) = serde_json::to_string(&state) {
-            let c_str = CString::new(json).unwrap();
-            cb(c_str.as_ptr());
-        }
+    if let Some(callback) = registered_callback(&CONNECTION_STATE_CALLBACK) {
+        send_json(callback, &build_connection_state_info());
     }
 }
 
@@ -669,16 +829,16 @@ async fn create_and_store_spirc(
     let spirc_arc = Arc::new(spirc);
     RUNTIME.spawn(spirc_task);
 
-    {
-        let mut spirc_guard = SPIRC.lock().unwrap();
-        *spirc_guard = Some(spirc_arc.clone());
-    }
-    SPIRC_READY.store(true, Ordering::SeqCst);
-
-    {
-        let mut state = SESSION_CONNECTION_STATE.lock().unwrap();
-        state.is_connected = true;
-    }
+    *SPIRC.lock().unwrap() = Some(spirc_arc.clone());
+    // Deliberately does not record success yet. Activation and, on a reconnect, the
+    // rehydrating load still have to run, and either can fail — `init_player_async` commits
+    // the whole set once, at the end, when the session is genuinely usable.
+    //
+    // Setting it here was subtly wrong in two ways. The activation that follows makes
+    // librespot emit SessionConnected, whose handler publishes a snapshot; with the flags
+    // already true that snapshot announced readiness before playback resumed. And a later
+    // failure could only clear the booleans, leaving a fresh connected-since timestamp and
+    // a reset attempt counter in the disconnected snapshot that followed.
 
     debug!(
         "[WAKE +{}ms] Spirc ready - connected to Spotify Connect",
@@ -691,9 +851,68 @@ async fn create_and_store_spirc(
     Ok(spirc_arc)
 }
 
-/// Subscribes to cluster updates on the session's dealer and spawns a task
-/// to process them. When the stream ends (Spirc died), triggers reconnection
-/// unless shutting down or sleeping.
+/// How often to check whether the current session needs recovery.
+const SESSION_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Watches for a session that is unusable while no other recovery owner is active.
+///
+/// Every other recovery trigger needs something to happen: the cluster listener only acts
+/// when its stream *closes*, and librespot's dealer retries internally so the stream can
+/// stay open for minutes past a dead session; the zombie check in
+/// `require_session_connected` only runs when a command is issued. While Spotifly is the
+/// active device something trips one of those quickly. While it is *not* active, nothing
+/// may. The same check also covers a partial initialization that stored a Session but never
+/// reached the connected-and-Spirc-ready state. In either case it starts the normal
+/// reconnect loop unless that loop or an intentional teardown already owns the lifecycle.
+///
+/// Cost is one sleeping task per generation, waking once a minute to read a few flags
+/// (`Session::is_invalid` is a lock read of a `bool`). It exits when its generation is
+/// superseded, so it dies with the session it belongs to rather than accumulating.
+fn spawn_session_health_check(generation: u64) {
+    RUNTIME.spawn(async move {
+        loop {
+            tokio::time::sleep(SESSION_HEALTH_CHECK_INTERVAL).await;
+
+            // Superseded: whatever replaced our session brought its own check.
+            if !listener_may_act(generation, SESSION_GENERATION.load(Ordering::SeqCst)) {
+                return;
+            }
+
+            // Sleep and shutdown invalidate the session on purpose.
+            if teardown_in_progress() {
+                continue;
+            }
+
+            let session_invalid = SESSION
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|s| s.is_invalid());
+
+            if health_check_should_recover(
+                session_invalid,
+                with_connection(|c| c.session_connected),
+                RECONNECTING.load(Ordering::SeqCst),
+                teardown_in_progress(),
+            ) {
+                debug!(
+                    "Session health check: session {} needs recovery (invalid={})",
+                    generation, session_invalid
+                );
+                let intent = RecoveryIntent::capture();
+                mark_disconnected("Session unusable");
+                spawn_reconnection_loop(intent);
+                // Recovery owns it from here; the rebuild spawns the next check.
+                return;
+            }
+        }
+    });
+}
+
+/// Subscribes to cluster updates on the session's dealer and spawns a task to process them.
+///
+/// When the stream ends, the Spirc it belonged to is gone, so this triggers reconnection —
+/// but only for the current generation, and only outside an intentional teardown.
 fn spawn_cluster_listener(session: &Session, generation: u64) -> Result<(), String> {
     let queue_stream = session
         .dealer()
@@ -707,9 +926,26 @@ fn spawn_cluster_listener(session: &Session, generation: u64) -> Result<(), Stri
         debug!("Cluster listener started (generation={})", generation);
         let mut stream = queue_stream;
         while let Some(msg_result) = stream.next().await {
+            // Same rule as the player event listener: a superseded cluster listener keeps
+            // receiving until its stream actually closes, and its updates describe a session
+            // that has been replaced. Checking only after the stream ends, as this used to,
+            // leaves every message before that point unguarded.
+            if !listener_may_act(generation, SESSION_GENERATION.load(Ordering::SeqCst)) {
+                continue;
+            }
+
             match msg_result {
                 Ok(cluster_update) => {
                     if let Some(cluster) = cluster_update.cluster.into_option() {
+                        // Derive our own activity from the cluster rather than inferring it
+                        // from whichever command happened to run last. This is the same
+                        // comparison SpircTask makes internally; Spotifly runs a second
+                        // subscription to the same dealer topic and has to reach the same
+                        // conclusion, or playback routing and the UI disagree.
+                        set_active_device(is_active_in_cluster(
+                            &cluster.active_device_id,
+                            current_device_id().as_deref(),
+                        ));
                         notify_active_device_id(&cluster.active_device_id);
                         if let Some(player_state) = cluster.player_state.into_option() {
                             send_playback_state(&player_state);
@@ -726,20 +962,17 @@ fn spawn_cluster_listener(session: &Session, generation: u64) -> Result<(), Stri
         debug!("Cluster listener ended (generation={})", generation);
 
         let current_gen = SESSION_GENERATION.load(Ordering::SeqCst);
-        if generation != current_gen {
+        if !should_recover_after_cluster_end(generation, current_gen, teardown_in_progress()) {
             debug!(
-                "Cluster listener from old generation {} ended (current={}), ignoring",
+                "Cluster listener ended without recovery (generation={}, current={})",
                 generation, current_gen
             );
             return;
         }
 
-        if SHUTTING_DOWN.load(Ordering::SeqCst) || SLEEPING.load(Ordering::SeqCst) {
-            return;
-        }
-
+        let intent = RecoveryIntent::capture();
         mark_disconnected("Cluster listener ended unexpectedly");
-        spawn_reconnection_loop();
+        spawn_reconnection_loop(intent);
     });
 
     Ok(())
@@ -747,20 +980,18 @@ fn spawn_cluster_listener(session: &Session, generation: u64) -> Result<(), Stri
 
 /// Request a fresh token from Swift via callback
 fn request_token_from_swift() {
-    let cb_guard = TOKEN_REQUEST_CALLBACK.lock().unwrap();
-    if let Some(callback) = *cb_guard {
-        let cb = callback;
-        drop(cb_guard);
-        debug!("Requesting fresh token from Swift");
-        cb();
-    } else {
-        debug!("No token request callback registered");
+    match registered_callback(&TOKEN_REQUEST_CALLBACK) {
+        Some(callback) => {
+            debug!("Requesting fresh token from Swift");
+            callback();
+        }
+        None => debug!("No token request callback registered"),
     }
 }
 
 /// Spawns the reconnection loop task.
 /// Uses exponential backoff and requests fresh tokens from Swift.
-fn spawn_reconnection_loop() {
+fn spawn_reconnection_loop(intent: RecoveryIntent) {
     // Check if already reconnecting
     if RECONNECTING.swap(true, Ordering::SeqCst) {
         debug!(
@@ -775,23 +1006,63 @@ fn spawn_reconnection_loop() {
         elapsed_since_wake_ms()
     );
 
-    RUNTIME.spawn(async {
-        let was_playing = IS_PLAYING.load(Ordering::SeqCst);
-        let was_active = IS_ACTIVE_DEVICE.load(Ordering::SeqCst);
+    RUNTIME.spawn(async move {
 
-        let delays = [0u64, 2, 5, 10, 30, 30, 30, 30, 30, 30];
+        // The generation this loop is recovering. Between two attempts it can sleep for up
+        // to 30 seconds, and during that time something else — a manual restart from the
+        // wake path, or spotifly_cleanup on logout — may have already rebuilt or torn down
+        // the session. Waking up and rebuilding anyway would replace a healthy new session
+        // with one built from a stale token. RECONNECTING alone never caught this: it says
+        // "a loop is running", not "the thing it is fixing still exists".
+        // Mutable on purpose: each rebuild attempt bumps SESSION_GENERATION itself, so the
+        // loop adopts the value its own attempt produced. Without that it reads its own
+        // work as a foreign supersede and gives up after a single failed attempt.
+        let mut recovering_generation = SESSION_GENERATION.load(Ordering::SeqCst);
 
-        for (attempt, delay) in delays.iter().enumerate() {
-            if *delay > 0 {
-                tokio::time::sleep(Duration::from_secs(*delay)).await;
+        // Backoff that never gives up. This used to be a fixed schedule of ten attempts
+        // totalling about three minutes, after which the loop exited — so an outage longer
+        // than that left the app dead with nothing running to notice the network coming
+        // back, and only a manual play would recover it. The loop is not idle polling: it
+        // exists only while disconnected and exits on any lifecycle event, because every
+        // iteration re-checks the generation and the teardown flags below.
+        let mut attempt: u32 = 0;
+
+        loop {
+            let delay = match attempt {
+                0 => 0,
+                1 => 2,
+                2 => 5,
+                3 => 10,
+                _ => 30,
+            };
+            // Advance before any `continue` below, so a token failure still backs off
+            // instead of spinning on a zero delay.
+            let attempt_number = attempt + 1;
+            attempt = attempt.saturating_add(1);
+
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_secs(delay)).await;
             }
 
-            debug!("[WAKE +{}ms] Reconnect attempt {}", elapsed_since_wake_ms(), attempt + 1);
-            RECONNECT_ATTEMPT.store(attempt as u32 + 1, Ordering::SeqCst);
-            {
-                let mut last_error = LAST_ERROR.lock().unwrap();
-                *last_error = Some(format!("Reconnecting (attempt {})", attempt + 1));
+            if !reconnect_may_proceed(
+                recovering_generation,
+                SESSION_GENERATION.load(Ordering::SeqCst),
+                teardown_in_progress(),
+            ) {
+                debug!(
+                    "[WAKE +{}ms] Abandoning reconnect for generation {}: superseded or torn down",
+                    elapsed_since_wake_ms(),
+                    recovering_generation
+                );
+                RECONNECTING.store(false, Ordering::SeqCst);
+                return;
             }
+
+            debug!("[WAKE +{}ms] Reconnect attempt {}", elapsed_since_wake_ms(), attempt_number);
+            with_connection(|c| {
+                c.reconnect_attempt = attempt_number;
+                c.last_error = Some(format!("Reconnecting (attempt {})", attempt_number));
+            });
             notify_connection_state_change();
 
             let (tx, rx) = tokio::sync::oneshot::channel::<String>();
@@ -815,125 +1086,54 @@ fn spawn_reconnection_loop() {
                 }
             };
 
-            // Try soft reconnect first (keeps Player alive), fall back to hard
-            if PLAYER.lock().unwrap().is_some() {
-                do_soft_reconnect_cleanup();
-
-                match soft_reconnect_async(&token, was_active).await {
-                    Ok(_) => {
-                        debug!("[WAKE +{}ms] Soft reconnect successful on attempt {}", elapsed_since_wake_ms(), attempt + 1);
-                        RECONNECTING.store(false, Ordering::SeqCst);
-
-                        // The new Spirc has no context — if we were mid-playlist it won't know
-                        // what track comes next and will stop when the current one ends.
-                        // Reload the context immediately so Spirc can advance through the playlist.
-                        // This causes a brief seek-to-position blip, which is better than stopping.
-                        if was_playing && was_active {
-                            let spirc = SPIRC.lock().unwrap().as_ref().cloned();
-                            if let Some(spirc) = spirc {
-                                debug!(
-                                    "[WAKE +{}ms] Soft reconnect: reloading context to restore Spirc queue",
-                                    elapsed_since_wake_ms()
-                                );
-                                resume_via_load(&spirc);
-                            }
-                        }
-
-                        // The Player keeps playing existing audio during soft reconnect.
-                        // But if a new play command was issued right before the disconnect,
-                        // the audio key fetch on the old session will time out (~1.5s) and
-                        // librespot will silently fail (context unavailable on new Spirc).
-                        // Detect this: if the Playing event never fires within 3s, retry.
-                        let pending = PENDING_PLAY.lock().unwrap().clone();
-                        if let Some(p) = pending {
-                            debug!("[WAKE +{}ms] Soft reconnect: pending play detected (id={}), spawning watchdog", elapsed_since_wake_ms(), p.request_id);
-                            RUNTIME.spawn(async move {
-                                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                                // Only retry if this exact request is still pending.
-                                // A newer request_id means the user issued a new play (superseded).
-                                // None means Playing fired and cleared it (success) or stop was called.
-                                let still_id = PENDING_PLAY.lock().unwrap().as_ref().map(|s| s.request_id);
-                                if still_id == Some(p.request_id) {
-                                    // Don't clear before the call: if the re-issue fails
-                                    // (e.g. session flapped again), the pending play remains set
-                                    // and the next soft reconnect can try again.
-                                    let result = match &p.request {
-                                        PendingPlayRequest::Uri(uri, track_index) => {
-                                            debug!("Pending play watchdog: Playing never fired for {} (id={}), re-issuing play_uri", uri, p.request_id);
-                                            match std::ffi::CString::new(uri.as_str()) {
-                                                Ok(cstr) => spotifly_play_uri(cstr.as_ptr(), *track_index),
-                                                Err(_) => return,
-                                            }
-                                        }
-                                        PendingPlayRequest::Tracks(json) => {
-                                            debug!("Pending play watchdog: Playing never fired for tracks (id={}), re-issuing play_tracks", p.request_id);
-                                            match std::ffi::CString::new(json.as_str()) {
-                                                Ok(cstr) => spotifly_play_tracks(cstr.as_ptr()),
-                                                Err(_) => return,
-                                            }
-                                        }
-                                        PendingPlayRequest::Radio(seed_uri) => {
-                                            debug!("Pending play watchdog: Playing never fired for radio {} (id={}), re-issuing play_radio", seed_uri, p.request_id);
-                                            play_radio_async(&seed_uri).await
-                                        }
-                                    };
-                                    debug!("Pending play watchdog: re-issue result={} (id={})", result, p.request_id);
-                                }
-                            });
-                        }
-                        return;
-                    }
-                    Err(e) => {
-                        debug!("[WAKE +{}ms] Soft reconnect failed: {}, falling back to hard reconnect", elapsed_since_wake_ms(), e);
-                    }
-                }
+            // Re-check after the token round-trip: requesting one from Swift can take up
+            // to ten seconds, which is plenty of time for a restart to land.
+            if !reconnect_may_proceed(
+                recovering_generation,
+                SESSION_GENERATION.load(Ordering::SeqCst),
+                teardown_in_progress(),
+            ) {
+                debug!("[WAKE +{}ms] Abandoning reconnect: state changed while fetching token", elapsed_since_wake_ms());
+                RECONNECTING.store(false, Ordering::SeqCst);
+                return;
             }
 
-            // Hard reconnect: full cleanup and rebuild
+            // One recovery strategy: tear everything down and rebuild Session, Player,
+            // Mixer and Spirc as a single generation, then restore the captured intent.
+            //
+            // There used to be a "soft reconnect" that kept the Player alive across
+            // sessions to avoid an audible gap. It bought a shorter interruption at the
+            // cost of a Player outliving the Session it was built for, which is what
+            // forced the librespot patch that makes Spirc adopt an orphaned
+            // play_request_id, the context-reload-after-reconnect blip, and a watchdog
+            // that re-issued play commands when the audio key fetch on the dead session
+            // silently timed out. A brief gap during an outage is the better trade.
             do_reconnect_cleanup();
 
-            match init_player_async(&token, was_active).await {
+            // Rehydration happens inside init_player_async, so that the session is fully
+            // settled before its readiness is published. See the note there.
+            match init_player_async(&token, intent.was_active, intent.should_resume()).await {
                 Ok(_) => {
-                    debug!("[WAKE +{}ms] Hard reconnect successful on attempt {}", elapsed_since_wake_ms(), attempt + 1);
+                    debug!("[WAKE +{}ms] Reconnect successful on attempt {}", elapsed_since_wake_ms(), attempt_number);
                     RECONNECTING.store(false, Ordering::SeqCst);
-
-                    // Auto-resume: the track will load paused via transfer(None).
-                    // When we receive the Paused event, we'll auto-resume if within this window.
-                    if was_playing {
-                        let resume_until = current_timestamp_ms() + 5000; // 5 second window
-                        RESUME_AFTER_RECONNECT_UNTIL_MS.store(resume_until, Ordering::SeqCst);
-                        debug!("[WAKE +{}ms] Will auto-resume after track loads (was playing before disconnect)", elapsed_since_wake_ms());
-                    }
-
                     return;
                 }
                 Err(e) => {
-                    debug!("[WAKE +{}ms] Hard reconnect attempt {} failed: {}", elapsed_since_wake_ms(), attempt + 1, e);
-                    {
-                        let mut last_error = LAST_ERROR.lock().unwrap();
-                        *last_error = Some(format!("Reconnect failed: {}", e));
-                    }
+                    debug!("[WAKE +{}ms] Reconnect attempt {} failed: {}", elapsed_since_wake_ms(), attempt_number, e);
+                    // Adopt the generation this attempt created. init_player_async bumps it
+                    // before it can fail, so leaving the old value here would make the next
+                    // iteration mistake our own rebuild for someone else's and abandon.
+                    //
+                    // Read from the attempt rather than from the counter: a logout and the
+                    // login after it can both have bumped it while this attempt ran, and
+                    // adopting *that* would have the loop rebuild over a session belonging
+                    // to another account. Reading our own value leaves the next iteration's
+                    // supersede check to notice and abandon, which is the right outcome.
+                    recovering_generation = LAST_BUILD_GENERATION.load(Ordering::SeqCst);
+                    with_connection(|c| c.last_error = Some(format!("Reconnect failed: {}", e)));
                     notify_connection_state_change();
                 }
             }
-        }
-
-        // All attempts exhausted
-        debug!("All reconnection attempts exhausted");
-        RECONNECTING.store(false, Ordering::SeqCst);
-        {
-            let mut last_error = LAST_ERROR.lock().unwrap();
-            *last_error = Some("Reconnection failed after 10 attempts".to_string());
-        }
-        notify_connection_state_change();
-
-        // Notify Swift that reconnection failed - it may want to show UI
-        let cb_guard = SESSION_DISCONNECTED_CALLBACK.lock().unwrap();
-        if let Some(callback) = *cb_guard {
-            let cb = callback;
-            drop(cb_guard);
-            debug!("Notifying Swift of reconnection failure");
-            cb();
         }
     });
 }
@@ -955,12 +1155,7 @@ pub extern "C" fn spotifly_force_reconnect() -> i32 {
     debug!("[WAKE +0ms] spotifly_force_reconnect called at {}", wake_ts);
 
     // Check if we even have a session
-    let has_session = {
-        let session_guard = SESSION.lock().unwrap();
-        session_guard.is_some()
-    };
-
-    if !has_session {
+    if SESSION.lock().unwrap().is_none() {
         debug!(
             "[WAKE +{}ms] Force reconnect: no session initialized",
             elapsed_since_wake_ms()
@@ -983,7 +1178,7 @@ pub extern "C" fn spotifly_force_reconnect() -> i32 {
     );
 
     mark_disconnected("Reconnecting after system wake");
-    spawn_reconnection_loop();
+    spawn_reconnection_loop(RecoveryIntent::capture());
 
     0
 }
@@ -995,11 +1190,8 @@ fn do_reconnect_cleanup() {
     debug!("do_reconnect_cleanup: full cleanup for reconnection");
 
     // Signal event listener to stop
-    {
-        let mut tx_guard = PLAYER_EVENT_TX.lock().unwrap();
-        if let Some(tx) = tx_guard.take() {
-            let _ = tx.send(());
-        }
+    if let Some(tx) = PLAYER_EVENT_TX.lock().unwrap().take() {
+        let _ = tx.send(());
     }
 
     // Shutdown Spirc first - this terminates the spirc_task and closes the dealer,
@@ -1008,135 +1200,30 @@ fn do_reconnect_cleanup() {
     shutdown_spirc("do_reconnect_cleanup");
 
     // Now clear Spirc reference
-    {
-        let mut spirc_guard = SPIRC.lock().unwrap();
-        *spirc_guard = None;
-    }
-    SPIRC_READY.store(false, Ordering::SeqCst);
+    *SPIRC.lock().unwrap() = None;
+    with_connection(|c| c.spirc_ready = false);
 
-    // Clear Player - must be recreated with new Session
-    {
-        let mut player_guard = PLAYER.lock().unwrap();
-        *player_guard = None;
-    }
+    // Clear Player - must be recreated with new Session. Tell Swift first: dropping the
+    // Player does not run Sink::stop, so the renderer would otherwise keep believing it is
+    // rendering and skip resetting its real-time throttle on the next start.
+    proxy_sink::ProxySink::notify_player_gone();
+    *PLAYER.lock().unwrap() = None;
 
     // Clear Mixer
-    {
-        let mut mixer_guard = MIXER.lock().unwrap();
-        *mixer_guard = None;
-    }
+    *MIXER.lock().unwrap() = None;
 
     // Clear Session
-    {
-        let mut session_guard = SESSION.lock().unwrap();
-        *session_guard = None;
-    }
+    *SESSION.lock().unwrap() = None;
 
-    // Clear device ID (will be regenerated)
-    {
-        let mut device_id_guard = DEVICE_ID.lock().unwrap();
-        *device_id_guard = None;
-    }
-
-    // Reset session connection state
-    {
-        let mut state = SESSION_CONNECTION_STATE.lock().unwrap();
-        state.is_connected = false;
-        state.connection_id = None;
-    }
-
-    CONNECTED_SINCE_MS.store(0, Ordering::SeqCst);
+    // Clear device ID (will be regenerated) and reset session connection state
+    with_connection(|c| {
+        c.device_id = None;
+        c.session_connected = false;
+        c.session_connection_id = None;
+        c.connected_since_ms = 0;
+    });
 
     debug!("do_reconnect_cleanup complete");
-}
-
-/// Soft reconnect: keeps Player, Mixer, and event listener alive.
-/// Only shuts down Spirc/Session and creates new ones. The Player continues
-/// playing uninterrupted because it doesn't need the Session for an
-/// already-loaded track.
-fn do_soft_reconnect_cleanup() {
-    debug!("do_soft_reconnect_cleanup: keeping Player/Mixer alive");
-
-    shutdown_spirc("do_soft_reconnect_cleanup");
-
-    {
-        let mut spirc_guard = SPIRC.lock().unwrap();
-        *spirc_guard = None;
-    }
-    SPIRC_READY.store(false, Ordering::SeqCst);
-
-    {
-        let mut session_guard = SESSION.lock().unwrap();
-        *session_guard = None;
-    }
-
-    {
-        let mut state = SESSION_CONNECTION_STATE.lock().unwrap();
-        state.is_connected = false;
-        state.connection_id = None;
-    }
-    CONNECTED_SINCE_MS.store(0, Ordering::SeqCst);
-}
-
-/// Soft reconnect: creates new Session + Spirc while keeping the existing
-/// Player and Mixer alive. Audio continues playing during reconnection.
-async fn soft_reconnect_async(
-    access_token: &str,
-    reactivate_after_reconnect: bool,
-) -> Result<(), String> {
-    let current_generation = SESSION_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    EVENT_LISTENER_GENERATION.store(current_generation, Ordering::SeqCst);
-    debug!(
-        "[WAKE +{}ms] soft_reconnect_async starting, generation={}",
-        elapsed_since_wake_ms(),
-        current_generation
-    );
-
-    let device_id = {
-        let guard = DEVICE_ID.lock().unwrap();
-        guard
-            .clone()
-            .unwrap_or_else(|| format!("spotifly_{}", std::process::id()))
-    };
-
-    let (session, credentials) = create_session(&device_id, access_token)?;
-
-    let player = PLAYER
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| "Player not available for soft reconnect".to_string())?;
-    let mixer = MIXER
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| "Mixer not available for soft reconnect".to_string())?;
-
-    // Swap the session on the existing Player so future track loads use it
-    player.set_session(session.clone());
-
-    {
-        let mut session_guard = SESSION.lock().unwrap();
-        *session_guard = Some(session.clone());
-    }
-
-    spawn_cluster_listener(&session, current_generation)?;
-    let spirc = create_and_store_spirc(&session, &credentials, player, mixer).await?;
-
-    // Re-activate only if we were active before disconnect.
-    // If we had just transferred to another device, stay passive.
-    if reactivate_after_reconnect {
-        match spirc.activate() {
-            Ok(_) => IS_ACTIVE_DEVICE.store(true, Ordering::SeqCst),
-            Err(e) => debug!("Soft reconnect: activate failed: {:?}", e),
-        }
-    } else {
-        IS_ACTIVE_DEVICE.store(false, Ordering::SeqCst);
-        debug!("Soft reconnect: keeping Spotifly inactive (was_active=false)");
-    }
-
-    notify_connection_state_change();
-    Ok(())
 }
 
 /// Initializes the player with the given access token.
@@ -1160,19 +1247,9 @@ pub extern "C" fn spotifly_init_player(access_token: *const c_char) -> i32 {
     SHUTTING_DOWN.store(false, Ordering::SeqCst);
     SLEEPING.store(false, Ordering::SeqCst);
 
-    if access_token.is_null() {
-        debug!("Player init error: access_token is null");
+    let Some(token_str) = (unsafe { c_string_arg(access_token) }) else {
+        debug!("Player init error: access_token is null or not valid UTF-8");
         return -1;
-    }
-
-    let token_str = unsafe {
-        match CStr::from_ptr(access_token).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                debug!("Player init error: invalid access_token string");
-                return -1;
-            }
-        }
     };
 
     // Check if we already have a session
@@ -1184,7 +1261,7 @@ pub extern "C" fn spotifly_init_player(access_token: *const c_char) -> i32 {
         }
     }
 
-    let result = RUNTIME.block_on(async { init_player_async(&token_str, false).await });
+    let result = RUNTIME.block_on(async { init_player_async(&token_str, false, false).await });
 
     match result {
         Ok(_) => 0,
@@ -1196,23 +1273,17 @@ pub extern "C" fn spotifly_init_player(access_token: *const c_char) -> i32 {
 }
 
 /// Helper function to create a new Player instance
-fn create_new_player(session: &Session) -> Result<Arc<Player>, String> {
-    let bitrate_setting = BITRATE_SETTING.load(Ordering::SeqCst);
-    let bitrate = match bitrate_setting {
-        0 => Bitrate::Bitrate96,
-        2 => Bitrate::Bitrate320,
-        _ => Bitrate::Bitrate160,
+fn create_new_player(session: &Session) -> Arc<Player> {
+    let (bitrate, bitrate_kbps) = match BITRATE_SETTING.load(Ordering::SeqCst) {
+        0 => (Bitrate::Bitrate96, 96),
+        2 => (Bitrate::Bitrate320, 320),
+        _ => (Bitrate::Bitrate160, 160),
     };
     let gapless = GAPLESS_SETTING.load(Ordering::SeqCst);
 
-    let _bitrate_kbps = match bitrate_setting {
-        0 => 96,
-        2 => 320,
-        _ => 160,
-    };
     debug!(
         "Player initialized: bitrate={}kbps, gapless={}",
-        _bitrate_kbps, gapless
+        bitrate_kbps, gapless
     );
 
     let player_config = PlayerConfig {
@@ -1239,17 +1310,50 @@ fn create_new_player(session: &Session) -> Result<Arc<Player>, String> {
     );
 
     // Store player globally
-    {
-        let mut player_guard = PLAYER.lock().unwrap();
-        *player_guard = Some(Arc::clone(&player));
-    }
+    *PLAYER.lock().unwrap() = Some(Arc::clone(&player));
 
-    Ok(player)
+    player
 }
 
-async fn init_player_async(access_token: &str, activate_after_connect: bool) -> Result<(), String> {
+/// Builds a complete, settled session and publishes its readiness exactly once, at the end.
+///
+/// The ordering matters. Readiness used to be published the moment Spirc existed, while
+/// activation and the rehydrating load still had to run — so Swift, which reacts to that
+/// publication by bootstrapping from the Web API, fetched and applied a server snapshot
+/// that Rust then immediately overwrote. That was visible as the playback position jumping
+/// forward to a stale value and back. Publishing once, when nothing further is pending,
+/// removes the window rather than racing it.
+/// Builds a session, and clears anything it left behind if a teardown began while it ran.
+///
+/// `build_player_async` stores Session, Player, Mixer and Spirc in the globals well before
+/// it can decide whether it is still wanted, so every error path after those stores would
+/// leak them. Normally the next reconnect attempt tidies up on its way in — but during a
+/// logout there is no next attempt: the loop sees the teardown flag and exits, leaving a
+/// live session for an account that is gone.
+async fn init_player_async(
+    access_token: &str,
+    activate_after_connect: bool,
+    resume_after_connect: bool,
+) -> Result<(), String> {
+    let result =
+        build_player_async(access_token, activate_after_connect, resume_after_connect).await;
+
+    if result.is_err() && teardown_in_progress() {
+        debug!("Initialization failed during teardown — clearing what it left behind");
+        do_reconnect_cleanup();
+    }
+
+    result
+}
+
+async fn build_player_async(
+    access_token: &str,
+    activate_after_connect: bool,
+    resume_after_connect: bool,
+) -> Result<(), String> {
     // Increment session generation - this invalidates any old cluster listeners
     let current_generation = SESSION_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    LAST_BUILD_GENERATION.store(current_generation, Ordering::SeqCst);
     debug!(
         "[WAKE +{}ms] init_player_async starting, generation={}",
         elapsed_since_wake_ms(),
@@ -1257,10 +1361,7 @@ async fn init_player_async(access_token: &str, activate_after_connect: bool) -> 
     );
 
     let device_id = format!("spotifly_{}", std::process::id());
-    {
-        let mut device_id_guard = DEVICE_ID.lock().unwrap();
-        *device_id_guard = Some(device_id.clone());
-    }
+    with_connection(|c| c.device_id = Some(device_id.clone()));
 
     let (session, credentials) = create_session(&device_id, access_token)?;
 
@@ -1268,14 +1369,11 @@ async fn init_player_async(access_token: &str, activate_after_connect: bool) -> 
     let mixer_config = MixerConfig::default();
     let mixer: Arc<SoftMixer> =
         Arc::new(SoftMixer::open(mixer_config).map_err(|e| format!("Mixer error: {}", e))?);
-    {
-        let mut mixer_guard = MIXER.lock().unwrap();
-        *mixer_guard = Some(Arc::clone(&mixer));
-    }
+    *MIXER.lock().unwrap() = Some(Arc::clone(&mixer));
 
     // Create new player - must be created with the new session because Player is
     // tightly coupled to Session's ChannelManager for decryption key requests
-    let player = create_new_player(&session)?;
+    let player = create_new_player(&session);
 
     // Get event channel from player, opting in to SetQueue events
     let mut event_channel = player.get_player_event_channel();
@@ -1283,8 +1381,9 @@ async fn init_player_async(access_token: &str, activate_after_connect: bool) -> 
     // Create channel for stopping event listener
     let (tx, mut rx) = mpsc::unbounded_channel::<()>();
 
-    // On soft reconnect, EVENT_LISTENER_GENERATION is updated without replacing the listener
-    EVENT_LISTENER_GENERATION.store(current_generation, Ordering::SeqCst);
+    // This listener belongs to the generation being built here, for its whole life: a
+    // rebuild replaces the listener along with the session, so the value never has to
+    // change underneath it.
     let player_clone = Arc::clone(&player);
     let event_listener_generation = current_generation;
     RUNTIME.spawn(async move {
@@ -1296,16 +1395,29 @@ async fn init_player_async(access_token: &str, activate_after_connect: bool) -> 
                     break;
                 }
                 event = event_channel.recv() => {
+                    // Drop everything from a superseded generation. A replaced listener
+                    // drains asynchronously after its successor is live — the logs show old
+                    // listeners still delivering seconds later — and without this guard it
+                    // would keep writing position, track, playing and active-device state
+                    // belonging to a session that no longer exists.
+                    //
+                    // `event.is_some()` matters: a closed channel must still reach the
+                    // `None` arm below and break the loop. Skipping on `None` would spin.
+                    if event.is_some()
+                        && !listener_may_act(
+                            event_listener_generation,
+                            SESSION_GENERATION.load(Ordering::SeqCst),
+                        )
+                    {
+                        continue;
+                    }
+
                     match event {
                         Some(PlayerEvent::Playing { position_ms, .. }) => {
                             debug!("PlayerEvent::Playing at {}ms", position_ms);
                             IS_PLAYING.store(true, Ordering::SeqCst);
-                            IS_ACTIVE_DEVICE.store(true, Ordering::SeqCst);
+                            set_active_device(true);
                             PLAYING_EVENT_SEQ.fetch_add(1, Ordering::SeqCst);
-                            // Clear auto-resume flag - we're already playing
-                            RESUME_AFTER_RECONNECT_UNTIL_MS.store(0, Ordering::SeqCst);
-                            // Clear pending play - track started successfully
-                            clear_pending_play();
                             update_position(position_ms);
                             // Send playback state update to Swift
                             send_local_playback_state(true, position_ms);
@@ -1317,27 +1429,6 @@ async fn init_player_async(access_token: &str, activate_after_connect: bool) -> 
                             update_position(position_ms);
                             // Send playback state update to Swift
                             send_local_playback_state(false, position_ms);
-
-                            // Auto-resume after reconnection if we were playing before disconnect
-                            let resume_until = RESUME_AFTER_RECONNECT_UNTIL_MS.load(Ordering::SeqCst);
-                            if resume_until > 0 && current_timestamp_ms() < resume_until {
-                                // Clear the flag first to prevent multiple resume attempts
-                                RESUME_AFTER_RECONNECT_UNTIL_MS.store(0, Ordering::SeqCst);
-                                debug!("[WAKE +{}ms] Auto-resuming playback after reconnection", elapsed_since_wake_ms());
-
-                                let spirc_guard = SPIRC.lock().unwrap();
-                                if let Some(spirc) = spirc_guard.as_ref() {
-                                    match spirc.play() {
-                                        Ok(_) => {
-                                            IS_PLAYING.store(true, Ordering::SeqCst);
-                                            debug!("[WAKE +{}ms] Auto-resume succeeded", elapsed_since_wake_ms());
-                                        }
-                                        Err(e) => {
-                                            debug!("[WAKE +{}ms] Auto-resume failed: {:?}", elapsed_since_wake_ms(), e);
-                                        }
-                                    }
-                                }
-                            }
                         }
                         Some(PlayerEvent::PositionChanged { position_ms, .. }) => {
                             // Periodic position update (every 200ms)
@@ -1351,13 +1442,25 @@ async fn init_player_async(access_token: &str, activate_after_connect: bool) -> 
                             update_position(position_ms);
                         }
                         Some(PlayerEvent::Stopped { .. }) => {
+                            // Deliberately does not touch active-device state: playback
+                            // stopping is not the same as losing the active Connect role.
+                            // This used to clear it, which fought the cluster-derived value
+                            // and made the UI think a remote speaker had taken over
+                            // whenever local playback simply ended.
                             IS_PLAYING.store(false, Ordering::SeqCst);
-                            IS_ACTIVE_DEVICE.store(false, Ordering::SeqCst);
                             update_position(0);
                         }
-                        Some(PlayerEvent::EndOfTrack { .. }) => {
-                            // Spirc handles auto-advance to next track automatically
-                            // We just update local state here
+                        Some(PlayerEvent::EndOfTrack { track_id, .. }) => {
+                            // Logged with the position it ended at: a natural end and a
+                            // stream that stopped early are otherwise indistinguishable in
+                            // the log, because Spirc's auto-advance is silent on success.
+                            // Without this, "did the track finish or get cut off?" cannot be
+                            // answered from a log at all.
+                            debug!(
+                                "PlayerEvent::EndOfTrack: {} at {}ms",
+                                track_id,
+                                POSITION_MS.load(Ordering::SeqCst)
+                            );
                             IS_PLAYING.store(false, Ordering::SeqCst);
                             update_position(0);
                         }
@@ -1375,25 +1478,11 @@ async fn init_player_async(access_token: &str, activate_after_connect: bool) -> 
                             CURRENT_DURATION_MS.store(duration_ms, Ordering::SeqCst);
 
                             // Emit Loading callback with track info (position 0 for auto-advance)
-                            let cb_guard = LOADING_CALLBACK.lock().unwrap();
-                            if let Some(callback) = *cb_guard {
-                                let cb = callback;
-                                drop(cb_guard);
-                                let notification = LoadingNotification {
+                            if let Some(callback) = registered_callback(&LOADING_CALLBACK) {
+                                send_json(callback, &LoadingNotification {
                                     track_uri: track_uri_str,
                                     position_ms: 0,
-                                };
-                                if let Ok(json) = serde_json::to_string(&notification) {
-                                    let c_str = CString::new(json).unwrap();
-                                    cb(c_str.as_ptr());
-                                }
-                            }
-
-                            // Also trigger state update callback
-                            let cb_guard = STATE_UPDATE_CALLBACK.lock().unwrap();
-                            if let Some(callback) = *cb_guard {
-                                drop(cb_guard);
-                                callback();
+                                });
                             }
                         }
                         Some(PlayerEvent::VolumeChanged { volume }) => {
@@ -1430,18 +1519,11 @@ async fn init_player_async(access_token: &str, activate_after_connect: bool) -> 
                                 *uri_guard = Some(track_uri_str.clone());
                             }
 
-                            let cb_guard = LOADING_CALLBACK.lock().unwrap();
-                            if let Some(callback) = *cb_guard {
-                                let cb = callback;
-                                drop(cb_guard);
-                                let notification = LoadingNotification {
+                            if let Some(callback) = registered_callback(&LOADING_CALLBACK) {
+                                send_json(callback, &LoadingNotification {
                                     track_uri: track_uri_str,
                                     position_ms,
-                                };
-                                if let Ok(json) = serde_json::to_string(&notification) {
-                                    let c_str = CString::new(json).unwrap();
-                                    cb(c_str.as_ptr());
-                                }
+                                });
                             }
                         }
                         Some(PlayerEvent::SetQueue {
@@ -1457,87 +1539,76 @@ async fn init_player_async(access_token: &str, activate_after_connect: bool) -> 
                                 prev_tracks.len()
                             );
                             update_current_context_uri(&context_uri);
-                            let cb_guard = SET_QUEUE_CALLBACK.lock().unwrap();
-                            if let Some(callback) = *cb_guard {
-                                let cb = callback;
-                                drop(cb_guard);
-                                let notification = SetQueueNotification {
-                                    context_uri,
-                                    current_track: current_track.map(|t| QueueTrackInfo {
-                                        uri: t.uri,
-                                        provider: t.provider,
-                                    }),
-                                    next_tracks: next_tracks
-                                        .into_iter()
-                                        .map(|t| QueueTrackInfo {
-                                            uri: t.uri,
-                                            provider: t.provider,
-                                        })
-                                        .collect(),
-                                    prev_tracks: prev_tracks
-                                        .into_iter()
-                                        .map(|t| QueueTrackInfo {
-                                            uri: t.uri,
-                                            provider: t.provider,
-                                        })
-                                        .collect(),
+                            if let Some(callback) = registered_callback(&SET_QUEUE_CALLBACK) {
+                                let to_track_info = |t: QueueTrack| QueueTrackInfo {
+                                    uri: t.uri,
+                                    provider: t.provider,
                                 };
-                                if let Ok(json) = serde_json::to_string(&notification) {
-                                    let c_str = CString::new(json).unwrap();
-                                    cb(c_str.as_ptr());
-                                }
+                                send_json(callback, &SetQueueNotification {
+                                    context_uri,
+                                    current_track: current_track.map(to_track_info),
+                                    next_tracks: next_tracks.into_iter().map(to_track_info).collect(),
+                                    prev_tracks: prev_tracks.into_iter().map(to_track_info).collect(),
+                                });
                             }
                         }
+                        // librespot emits SessionDisconnected when the local Connect device
+                        // becomes INACTIVE — not when the network session fails.
+                        // SpircTask::handle_disconnect() runs on an explicit Disconnect, on
+                        // shutdown, and on any cluster update that hands the active role to
+                        // another device. (This is upstream behavior, not part of our patch.)
+                        //
+                        // Treating it as an outage meant an ordinary handoff to a phone or a
+                        // speaker marked the connection dead and started a reconnect loop
+                        // against a perfectly healthy session.
                         Some(PlayerEvent::SessionDisconnected { connection_id, user_name }) => {
-                            // Read generation dynamically so soft reconnects can update it
-                            // without replacing the event listener
-                            let my_gen = EVENT_LISTENER_GENERATION.load(Ordering::SeqCst);
-                            debug!("[WAKE +{}ms] SessionDisconnected event: connection_id={}, user={}, listener_generation={}",
-                                   elapsed_since_wake_ms(), connection_id, user_name, my_gen);
+                            debug!("[WAKE +{}ms] became inactive (SessionDisconnected): connection_id={}, user={}, listener_generation={}",
+                                   elapsed_since_wake_ms(), connection_id, user_name, event_listener_generation);
 
-                            // Check if this event is from a stale session
-                            let current_gen = SESSION_GENERATION.load(Ordering::SeqCst);
-                            if my_gen != current_gen {
-                                debug!("[WAKE +{}ms] SessionDisconnected from old generation {} (current={}), ignoring",
-                                       elapsed_since_wake_ms(), my_gen, current_gen);
-                                continue;
+                            // Capture before clearing: the recovery decision below needs to
+                            // know what was playing, and set_active_device wipes half of it.
+                            let intent = RecoveryIntent::capture();
+                            set_active_device(false);
+
+                            // Only recover if the transport is genuinely broken. A dead
+                            // Session here means the Spirc task went down with it (librespot
+                            // calls handle_disconnect on unexpected shutdown), which the
+                            // cluster listener may not observe if the dealer stream is still
+                            // open. A missing Session means some other path already owns the
+                            // lifecycle, so leave it alone.
+                            let session_invalid = SESSION
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .is_some_and(|s| s.is_invalid());
+
+                            if should_recover_after_deactivation(
+                                session_invalid,
+                                teardown_in_progress(),
+                            ) {
+                                debug!("[WAKE +{}ms] Session is invalid at deactivation - recovering", elapsed_since_wake_ms());
+                                mark_disconnected("Session invalid");
+                                spawn_reconnection_loop(intent);
+                            } else {
+                                notify_connection_state_change();
                             }
 
-                            mark_disconnected("Session disconnected");
-
-                            // Spawn reconnection loop if not intentionally sleeping/shutting down
-                            if SHUTTING_DOWN.load(Ordering::SeqCst) {
-                                debug!("[WAKE +{}ms] SessionDisconnected during shutdown - not reconnecting", elapsed_since_wake_ms());
-                            } else if SLEEPING.load(Ordering::SeqCst) {
-                                debug!("[WAKE +{}ms] SessionDisconnected during sleep - not reconnecting", elapsed_since_wake_ms());
-                            } else {
-                                spawn_reconnection_loop();
+                            if let Some(callback) = registered_callback(&BECAME_INACTIVE_CALLBACK) {
+                                callback();
                             }
                         }
+                        // Emitted when the local Connect device becomes ACTIVE. Carries the
+                        // session's connection id, but says nothing about network health -
+                        // the session was already connected before activation.
                         Some(PlayerEvent::SessionConnected { connection_id, user_name }) => {
-                            debug!("[WAKE +{}ms] SessionConnected event: connection_id={}, user={}", elapsed_since_wake_ms(), connection_id, user_name);
-                            // Update session state
-                            {
-                                let mut state = SESSION_CONNECTION_STATE.lock().unwrap();
-                                state.is_connected = true;
-                                state.connection_id = Some(connection_id);
-                            }
-                            // Set connected timestamp and reset reconnect counter
-                            CONNECTED_SINCE_MS.store(current_timestamp_ms(), Ordering::SeqCst);
-                            RECONNECT_ATTEMPT.store(0, Ordering::SeqCst);
-                            // Clear last error on successful connect
-                            {
-                                let mut last_error = LAST_ERROR.lock().unwrap();
-                                *last_error = None;
-                            }
+                            debug!("[WAKE +{}ms] became active (SessionConnected): connection_id={}, user={}", elapsed_since_wake_ms(), connection_id, user_name);
+                            set_active_device(true);
+                            with_connection(|c| c.session_connection_id = Some(connection_id));
 
                             // Notify connection state change
                             notify_connection_state_change();
-                            let cb_guard = SESSION_CONNECTED_CALLBACK.lock().unwrap();
-                            if let Some(callback) = *cb_guard {
-                                let cb = callback;
-                                drop(cb_guard);
-                                cb();
+                            if let Some(callback) = registered_callback(&BECAME_ACTIVE_CALLBACK) {
+                                callback();
                             }
                         }
                         Some(PlayerEvent::SessionClientChanged {
@@ -1550,20 +1621,15 @@ async fn init_player_async(access_token: &str, activate_after_connect: bool) -> 
                                 "SessionClientChanged event: id={}, name={}, brand={}, model={}",
                                 client_id, client_name, client_brand_name, client_model_name
                             );
-                            let cb_guard = SESSION_CLIENT_CHANGED_CALLBACK.lock().unwrap();
-                            if let Some(callback) = *cb_guard {
-                                let cb = callback;
-                                drop(cb_guard);
-                                let info = SessionClientInfo {
+                            if let Some(callback) =
+                                registered_callback(&SESSION_CLIENT_CHANGED_CALLBACK)
+                            {
+                                send_json(callback, &SessionClientInfo {
                                     client_id,
                                     client_name,
                                     client_brand_name,
                                     client_model_name,
-                                };
-                                if let Ok(json) = serde_json::to_string(&info) {
-                                    let c_str = CString::new(json).unwrap();
-                                    cb(c_str.as_ptr());
-                                }
+                                });
                             }
                         }
                         None => break,
@@ -1575,37 +1641,142 @@ async fn init_player_async(access_token: &str, activate_after_connect: bool) -> 
         drop(player_clone);
     });
 
-    {
-        let mut session_guard = SESSION.lock().unwrap();
-        *session_guard = Some(session.clone());
-    }
-    {
-        let mut tx_guard = PLAYER_EVENT_TX.lock().unwrap();
-        *tx_guard = Some(tx);
-    }
+    *SESSION.lock().unwrap() = Some(session.clone());
+    *PLAYER_EVENT_TX.lock().unwrap() = Some(tx);
 
     spawn_cluster_listener(&session, current_generation)?;
+    spawn_session_health_check(current_generation);
 
     match create_and_store_spirc(&session, &credentials, player, mixer).await {
         Ok(spirc) => {
             // Passive startup by default: do not take over the active device on launch.
             // Re-activate only when reconnecting from a previously-active local session.
+            //
+            // Recorded, not published — the single notify at the end of this function
+            // covers it. set_active_device would publish here, before the rehydration
+            // below, reopening the window this ordering exists to close.
             if activate_after_connect {
                 match spirc.activate() {
-                    Ok(_) => IS_ACTIVE_DEVICE.store(true, Ordering::SeqCst),
+                    Ok(_) => {
+                        store_active_device(true);
+                    }
                     Err(e) => debug!("Auto-activation failed: {:?}", e),
                 }
             } else {
-                IS_ACTIVE_DEVICE.store(false, Ordering::SeqCst);
+                store_active_device(false);
             }
+
+            // Rehydrate before announcing readiness. The rebuilt Player has no track
+            // loaded, and nothing else will load one: Spirc coming up and the device
+            // becoming active only make it *available* to play, not playing. Without this
+            // the session returns healthy and silent while Swift still shows the pre-outage
+            // position, because IS_PLAYING and the position anchor survive the rebuild.
+            //
+            // This used to arm a five-second window waiting for a Paused event, on the
+            // assumption that the track would load itself via transfer(None) — nothing in
+            // this path ever called transfer(None), so the event never came.
+            if resume_after_connect {
+                let seq_before = PLAYING_EVENT_SEQ.load(Ordering::SeqCst);
+                let result = resume_via_load(&spirc);
+                debug!(
+                    "[WAKE +{}ms] Rehydrate after reconnect: load result={}",
+                    elapsed_since_wake_ms(),
+                    result
+                );
+
+                if result == ERROR_NEEDS_REINIT {
+                    // Closed command channel: this Spirc is already dead, so the session can
+                    // never play. Nothing to roll back — success is committed below, after
+                    // this point, so the connection state still reads disconnected.
+                    return Err("Rehydration failed: Spirc command channel closed".to_string());
+                }
+
+                if result != 0 {
+                    // Nothing to resume — no saved context or track URI. Reachable when an
+                    // outage lands between a play command and the player events that record
+                    // what is playing. The session itself is fine, so failing here would
+                    // make every later attempt fail identically, forever.
+                    debug!(
+                        "[WAKE +{}ms] Rehydrate: nothing to resume (result={})",
+                        elapsed_since_wake_ms(),
+                        result
+                    );
+                } else if !wait_for_playing_event_async(seq_before, REHYDRATE_PLAYING_TIMEOUT).await
+                {
+                    // Spirc::load only queues a command, so a zero result means "accepted",
+                    // not "playing". Waiting keeps Swift's Web API bootstrap out of the gap
+                    // between the two. A timeout is not fatal: the load may still land, and
+                    // tearing down an otherwise healthy session would be worse than
+                    // announcing it late.
+                    debug!(
+                        "[WAKE +{}ms] Rehydrate: no Playing event within {:?}, publishing anyway",
+                        elapsed_since_wake_ms(),
+                        REHYDRATE_PLAYING_TIMEOUT
+                    );
+                }
+            }
+
+            // Committing late means this can be reached after something else took over —
+            // spotifly_cleanup on logout, a manual retry, or sleep, any of which can land
+            // during the rehydration wait above. Writing success then would resurrect a
+            // dead session as healthy and stop the health check from recovering it.
+            let superseded =
+                !listener_may_act(current_generation, SESSION_GENERATION.load(Ordering::SeqCst));
+            let tearing_down = teardown_in_progress();
+
+            if superseded || tearing_down {
+                // Returning an error is not enough on the teardown path. This attempt has
+                // already stored its Session, Player and Spirc in the globals, so refusing
+                // to publish leaves them live and connected — on logout that means the
+                // account stays announced on Spotify Connect, which is exactly what the
+                // shutdown was for. Teardown is unambiguous: nothing newer is coming, so
+                // clear what this attempt built.
+                //
+                // A supersede on its own is the opposite case — a newer generation owns the
+                // globals by now, and tearing them down would destroy its work, not ours.
+                // Teardown outranks that: `init_player_async` clears both teardown flags as
+                // it starts, so a flag that is set now means no newer generation began after
+                // it, whatever the counter says.
+                if tearing_down {
+                    debug!(
+                        "Generation {} finished during teardown — clearing what it built",
+                        current_generation
+                    );
+                    // Through the handle this attempt holds, not the global one. A cleanup
+                    // that landed between storing the Spirc and reaching here has already
+                    // nilled the global, so `do_reconnect_cleanup` would find nothing to
+                    // stop — while this Spirc's task stays alive holding the session, which
+                    // is precisely the thing that must not survive a logout.
+                    let _ = spirc.shutdown();
+                    do_reconnect_cleanup();
+                }
+
+                return Err(format!(
+                    "Initialization for generation {} was superseded before it completed",
+                    current_generation
+                ));
+            }
+
+            // Single commit-and-publish point: session up, device activated, playback
+            // rehydrated. Recording success only here means a failure anywhere above
+            // leaves the previous disconnected state untouched, and no snapshot in
+            // between can announce a session that cannot yet play.
+            with_connection(|c| {
+                c.spirc_ready = true;
+                c.session_connected = true;
+                c.connected_since_ms = current_timestamp_ms();
+                c.reconnect_attempt = 0;
+                c.last_error = None;
+            });
             notify_connection_state_change();
         }
         Err(e) => {
-            // Spirc failed -- fall back to manual session connection for basic playback
-            debug!("{}, falling back to basic playback", e);
-            if let Err(connect_err) = session.connect(credentials, true).await {
-                return Err(format!("Session connect error: {}", connect_err));
-            }
+            // No fallback: every Spotifly control goes through Spirc, so a bare connected
+            // Session is not a usable player. This used to call session.connect() and
+            // return Ok, which reported success while leaving Swift with a player whose
+            // every command would fail - and because initializeIfNeeded then refused to
+            // retry, that state was permanent.
+            return Err(format!("Spirc initialization failed: {}", e));
         }
     }
 
@@ -1622,9 +1793,7 @@ fn check_and_send_volume(volume: u32) {
         LAST_VOLUME.store(volume_u16, Ordering::SeqCst);
         debug!("Volume changed: {} -> {}", last, volume_u16);
 
-        let cb_guard = VOLUME_CALLBACK.lock().unwrap();
-        if let Some(callback) = *cb_guard {
-            drop(cb_guard);
+        if let Some(callback) = registered_callback(&VOLUME_CALLBACK) {
             callback(volume_u16);
         }
     }
@@ -1647,12 +1816,7 @@ const ERROR_NOT_CONNECTED: i32 = -3;
 /// Returns 1 if the session is connected and ready for commands, 0 otherwise.
 #[no_mangle]
 pub extern "C" fn spotifly_is_session_connected() -> i32 {
-    let state = SESSION_CONNECTION_STATE.lock().unwrap();
-    if state.is_connected {
-        1
-    } else {
-        0
-    }
+    i32::from(with_connection(|c| c.session_connected))
 }
 
 /// Helper to check if session is connected. Returns ERROR_NOT_CONNECTED if not.
@@ -1662,12 +1826,10 @@ pub extern "C" fn spotifly_is_session_connected() -> i32 {
 /// ever firing SessionDisconnected (because the Spirc task was idle).
 /// When detected, updates state and triggers reconnection proactively.
 fn require_session_connected() -> Result<(), i32> {
-    let state = SESSION_CONNECTION_STATE.lock().unwrap();
-    if !state.is_connected {
+    if !with_connection(|c| c.session_connected) {
         debug!("Command rejected: session not connected");
         return Err(ERROR_NOT_CONNECTED);
     }
-    drop(state);
 
     let session_invalid = SESSION
         .lock()
@@ -1678,7 +1840,7 @@ fn require_session_connected() -> Result<(), i32> {
     if session_invalid {
         debug!("Detected zombie session (is_connected=true but Session is invalid)");
         mark_disconnected("Session expired");
-        spawn_reconnection_loop();
+        spawn_reconnection_loop(RecoveryIntent::capture());
         return Err(ERROR_NOT_CONNECTED);
     }
 
@@ -1695,63 +1857,50 @@ fn send_playback_state(player_state: &PlayerState) {
         update_current_context_uri(context_uri);
     }
 
-    let cb_guard = PLAYBACK_STATE_CALLBACK.lock().unwrap();
-    if let Some(callback) = *cb_guard {
-        let cb = callback;
-        drop(cb_guard);
-
-        // Extract track URI
-        let track_uri = player_state
-            .track
-            .as_ref()
-            .map(|t| t.uri.clone())
-            .unwrap_or_default();
-
-        // Extract playback options (shuffle, repeat)
-        let options = player_state.options.as_ref();
-        let shuffle = options.map(|o| o.shuffling_context).unwrap_or(false);
-        let repeat_track = options.map(|o| o.repeating_track).unwrap_or(false);
-        let repeat_context = options.map(|o| o.repeating_context).unwrap_or(false);
-        update_playback_options(shuffle, repeat_track, repeat_context);
-
-        let update = PlaybackStateUpdate {
-            is_playing: player_state.is_playing,
-            is_paused: player_state.is_paused,
-            track_uri,
-            position_ms: player_state.position_as_of_timestamp,
-            duration_ms: player_state.duration,
-            shuffle,
-            repeat_track,
-            repeat_context,
-            timestamp_ms: player_state.timestamp,
-        };
-
-        debug!(
-            "PlaybackState: playing={}, paused={}, position={}ms, duration={}ms, timestamp={}ms, shuffle={}, repeat_track={}, repeat_context={}",
-            update.is_playing,
-            update.is_paused,
-            update.position_ms,
-            update.duration_ms,
-            update.timestamp_ms,
-            update.shuffle,
-            update.repeat_track,
-            update.repeat_context
-        );
-
-        if let Ok(json) = serde_json::to_string(&update) {
-            debug!(
-                "Sending playback state JSON ({} bytes) to Swift callback",
-                json.len()
-            );
-            let c_str = CString::new(json).unwrap();
-            cb(c_str.as_ptr());
-            debug!("Playback state callback returned");
-        } else {
-            debug!("Failed to serialize playback state to JSON");
-        }
-    } else {
+    let Some(callback) = registered_callback(&PLAYBACK_STATE_CALLBACK) else {
         debug!("No playback state callback registered, skipping update");
-    }
+        return;
+    };
+
+    // Extract track URI
+    let track_uri = player_state
+        .track
+        .as_ref()
+        .map(|t| t.uri.clone())
+        .unwrap_or_default();
+
+    // Extract playback options (shuffle, repeat)
+    let options = player_state.options.as_ref();
+    let shuffle = options.map(|o| o.shuffling_context).unwrap_or(false);
+    let repeat_track = options.map(|o| o.repeating_track).unwrap_or(false);
+    let repeat_context = options.map(|o| o.repeating_context).unwrap_or(false);
+    update_playback_options(shuffle, repeat_track, repeat_context);
+
+    let update = PlaybackStateUpdate {
+        is_playing: player_state.is_playing,
+        is_paused: player_state.is_paused,
+        track_uri,
+        position_ms: player_state.position_as_of_timestamp,
+        duration_ms: player_state.duration,
+        shuffle,
+        repeat_track,
+        repeat_context,
+        timestamp_ms: player_state.timestamp,
+    };
+
+    debug!(
+        "PlaybackState: playing={}, paused={}, position={}ms, duration={}ms, timestamp={}ms, shuffle={}, repeat_track={}, repeat_context={}",
+        update.is_playing,
+        update.is_paused,
+        update.position_ms,
+        update.duration_ms,
+        update.timestamp_ms,
+        update.shuffle,
+        update.repeat_track,
+        update.repeat_context
+    );
+
+    send_json(callback, &update);
 }
 
 /// Send playback state update from local player events (Playing, Paused)
@@ -1763,52 +1912,96 @@ fn send_local_playback_state(is_playing: bool, position_ms: u32) {
         is_playing, position_ms
     );
 
-    let cb_guard = PLAYBACK_STATE_CALLBACK.lock().unwrap();
-    if let Some(callback) = *cb_guard {
-        let cb = callback;
-        drop(cb_guard);
+    let Some(callback) = registered_callback(&PLAYBACK_STATE_CALLBACK) else {
+        return;
+    };
 
-        // Get track URI from local state
-        let track_uri = CURRENT_TRACK_URI
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_default();
+    // Get track URI from local state
+    let track_uri = CURRENT_TRACK_URI
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_default();
 
-        // Get duration from local state
-        let duration_ms = CURRENT_DURATION_MS.load(Ordering::SeqCst);
-        let (shuffle, repeat_track, repeat_context) = current_playback_options();
+    // Get duration from local state
+    let duration_ms = CURRENT_DURATION_MS.load(Ordering::SeqCst);
+    let (shuffle, repeat_track, repeat_context) = current_playback_options();
 
-        let timestamp_ms = current_timestamp_ms() as i64;
+    let update = PlaybackStateUpdate {
+        is_playing,
+        is_paused: !is_playing,
+        track_uri,
+        position_ms: position_ms as i64,
+        duration_ms: duration_ms as i64,
+        shuffle,
+        repeat_track,
+        repeat_context,
+        timestamp_ms: current_timestamp_ms() as i64,
+    };
 
-        let update = PlaybackStateUpdate {
-            is_playing,
-            is_paused: !is_playing,
-            track_uri,
-            position_ms: position_ms as i64,
-            duration_ms: duration_ms as i64,
-            shuffle,
-            repeat_track,
-            repeat_context,
-            timestamp_ms,
-        };
+    debug!(
+        "Local PlaybackState: playing={}, paused={}, position={}ms, duration={}ms, shuffle={}, repeat_track={}, repeat_context={}",
+        update.is_playing,
+        update.is_paused,
+        update.position_ms,
+        update.duration_ms,
+        update.shuffle,
+        update.repeat_track,
+        update.repeat_context
+    );
 
-        debug!(
-            "Local PlaybackState: playing={}, paused={}, position={}ms, duration={}ms, shuffle={}, repeat_track={}, repeat_context={}",
-            update.is_playing,
-            update.is_paused,
-            update.position_ms,
-            update.duration_ms,
-            update.shuffle,
-            update.repeat_track,
-            update.repeat_context
-        );
+    send_json(callback, &update);
+}
 
-        if let Ok(json) = serde_json::to_string(&update) {
-            let c_str = CString::new(json).unwrap();
-            cb(c_str.as_ptr());
+/// Converts a Connect-state track into a queue item.
+///
+/// Metadata is left empty on purpose: Swift resolves it from the AppStore by URI, so
+/// carrying names and artwork across the FFI boundary would just duplicate it.
+fn to_queue_item(track: &ProvidedTrack) -> QueueItem {
+    QueueItem {
+        uri: track.uri.clone(),
+        name: String::new(),
+        artist: String::new(),
+        image_url: String::new(),
+        duration_ms: 0,
+        album_name: String::new(),
+        provider: track.provider.clone(),
+    }
+}
+
+/// Collects the playable tracks of one queue side, stopping at the first delimiter.
+///
+/// `spotify:delimiter` marks the boundary of what the user actually queued: after it in
+/// next_tracks comes Spotify's autoplay continuation, and in prev_tracks it marks the
+/// start of the context. Showing either as part of the queue would present tracks the
+/// user never chose.
+fn collect_queue_items(tracks: &[ProvidedTrack], side: &str) -> Vec<QueueItem> {
+    let mut items = Vec::new();
+
+    for (i, track) in tracks.iter().enumerate() {
+        if i < 3 || !track.uri.starts_with("spotify:track:") {
+            debug!(
+                "{} track[{}] uri='{}' provider='{}'",
+                side, i, track.uri, track.provider
+            );
+        }
+
+        if track.uri == "spotify:delimiter" {
+            debug!(
+                "Stopping {} at delimiter (index {}), hiding {} tracks",
+                side,
+                i,
+                tracks.len() - i - 1
+            );
+            break;
+        }
+
+        if track.uri.starts_with("spotify:track:") {
+            items.push(to_queue_item(track));
         }
     }
+
+    items
 }
 
 fn process_and_send_queue(player_state: PlayerState) {
@@ -1820,120 +2013,49 @@ fn process_and_send_queue(player_state: PlayerState) {
         update_current_context_uri(&player_state.context_uri);
     }
 
-    let cb_guard = QUEUE_CALLBACK.lock().unwrap();
-    if let Some(callback) = *cb_guard {
-        debug!("Callback is registered, processing queue");
-        let cb = callback;
-        drop(cb_guard);
+    let Some(callback) = registered_callback(&QUEUE_CALLBACK) else {
+        debug!("No callback registered, skipping queue update");
+        return;
+    };
 
-        // Helper to convert ProvidedTrack to QueueItem
-        let to_queue_item = |t: &librespot_protocol::player::ProvidedTrack| -> QueueItem {
-            QueueItem {
-                uri: t.uri.clone(),
-                name: String::new(),
-                artist: String::new(),
-                image_url: String::new(),
-                duration_ms: 0,
-                album_name: String::new(),
-                provider: t.provider.clone(),
-            }
-        };
-
-        // Process current track
-        let current_track = player_state.track.into_option().and_then(|t| {
-            debug!("current track[0] uri='{}' provider='{}'", t.uri, t.provider);
-            if t.uri.starts_with("spotify:track:") {
-                Some(to_queue_item(&t))
-            } else {
-                None
-            }
-        });
-
-        // Process next_tracks - stop at first delimiter (autoplay boundary)
-        let mut next_tracks: Vec<QueueItem> = Vec::new();
-        for (i, t) in player_state.next_tracks.iter().enumerate() {
-            if i < 3 || !t.uri.starts_with("spotify:track:") {
-                debug!(
-                    "next track[{}] uri='{}' provider='{}'",
-                    i, t.uri, t.provider
-                );
-            }
-
-            // Stop at first delimiter - everything after is autoplay content
-            if t.uri == "spotify:delimiter" {
-                debug!(
-                    "Stopping at delimiter (index {}), hiding {} autoplay tracks",
-                    i,
-                    player_state.next_tracks.len() - i - 1
-                );
-                break;
-            }
-
-            if t.uri.starts_with("spotify:track:") {
-                next_tracks.push(to_queue_item(t));
-            }
+    let current_track = player_state.track.into_option().and_then(|t| {
+        debug!("current track[0] uri='{}' provider='{}'", t.uri, t.provider);
+        if t.uri.starts_with("spotify:track:") {
+            Some(to_queue_item(&t))
+        } else {
+            None
         }
+    });
+    let next_tracks = collect_queue_items(&player_state.next_tracks, "next");
+    let prev_tracks = collect_queue_items(&player_state.prev_tracks, "prev");
 
-        // Process prev_tracks - also stop at delimiter (in reverse, it marks context boundary)
-        let mut prev_tracks: Vec<QueueItem> = Vec::new();
-        for (i, t) in player_state.prev_tracks.iter().enumerate() {
-            if i < 3 || !t.uri.starts_with("spotify:track:") {
-                debug!(
-                    "prev track[{}] uri='{}' provider='{}'",
-                    i, t.uri, t.provider
-                );
-            }
+    debug!(
+        "Queue counts: current={}, next={}, prev={}",
+        if current_track.is_some() { 1 } else { 0 },
+        next_tracks.len(),
+        prev_tracks.len()
+    );
 
-            // Stop at delimiter
-            if t.uri == "spotify:delimiter" {
-                debug!("Stopping prev at delimiter (index {})", i);
-                break;
-            }
-
-            if t.uri.starts_with("spotify:track:") {
-                prev_tracks.push(to_queue_item(t));
-            }
-        }
-
-        debug!(
-            "Queue counts: current={}, next={}, prev={}",
-            if current_track.is_some() { 1 } else { 0 },
-            next_tracks.len(),
-            prev_tracks.len()
-        );
-
-        let queue_state = QueueState {
+    send_json(
+        callback,
+        &QueueState {
             track: current_track,
             next_tracks,
             prev_tracks,
-        };
-
-        if let Ok(json) = serde_json::to_string(&queue_state) {
-            debug!(
-                "Sending queue JSON ({} bytes) to Swift callback",
-                json.len()
-            );
-            let c_str = CString::new(json).unwrap();
-            cb(c_str.as_ptr());
-            debug!("Swift callback returned");
-        } else {
-            debug!("Failed to serialize queue state to JSON");
-        }
-    } else {
-        debug!("No callback registered, skipping queue update");
-    }
+        },
+    );
 }
 
 /// Helper to ensure the device is active before loading content.
 /// If not active, activates via Spirc directly (no spclient HTTP needed).
 /// Returns Ok(()) if ready to load, Err(i32) with error code if activation failed.
 fn ensure_active_for_playback(spirc: &Arc<Spirc>) -> Result<(), i32> {
-    if !IS_ACTIVE_DEVICE.load(Ordering::SeqCst) {
+    if !is_active_device() {
         debug!("Device not active, activating via spirc.activate()");
         match spirc.activate() {
             Ok(_) => {
                 debug!("Activate succeeded");
-                IS_ACTIVE_DEVICE.store(true, Ordering::SeqCst);
+                set_active_device(true);
             }
             Err(_e) => {
                 debug!("Activate failed: {:?}", _e);
@@ -1955,19 +2077,9 @@ pub extern "C" fn spotifly_play_tracks(track_uris_json: *const c_char) -> i32 {
     if let Err(e) = require_session_connected() {
         return e;
     }
-    if track_uris_json.is_null() {
-        debug!("Play tracks error: track_uris_json is null");
+    let Some(track_uris_str) = (unsafe { c_string_arg(track_uris_json) }) else {
+        debug!("Play tracks error: track_uris_json is null or not valid UTF-8");
         return -1;
-    }
-
-    let track_uris_str = unsafe {
-        match CStr::from_ptr(track_uris_json).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                debug!("Play tracks error: invalid track_uris_json string");
-                return -1;
-            }
-        }
     };
 
     // Parse JSON array of track URIs
@@ -2004,8 +2116,7 @@ pub extern "C" fn spotifly_play_tracks(track_uris_json: *const c_char) -> i32 {
             match spirc.load(load_request) {
                 Ok(_) => {
                     debug!("Spirc.load(tracks) succeeded");
-                    IS_ACTIVE_DEVICE.store(true, Ordering::SeqCst);
-                    set_pending_play(PendingPlayRequest::Tracks(track_uris_str.clone()));
+                    set_active_device(true);
                     0
                 }
                 Err(_e) => {
@@ -2028,19 +2139,9 @@ pub extern "C" fn spotifly_play_tracks(track_uris_json: *const c_char) -> i32 {
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
 pub extern "C" fn spotifly_play_uri(uri_or_url: *const c_char, track_index: i32) -> i32 {
-    if uri_or_url.is_null() {
-        debug!("Play error: uri_or_url is null");
+    let Some(input_str) = (unsafe { c_string_arg(uri_or_url) }) else {
+        debug!("Play error: uri_or_url is null or not valid UTF-8");
         return -1;
-    }
-
-    let input_str = unsafe {
-        match CStr::from_ptr(uri_or_url).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                debug!("Play error: invalid uri_or_url string");
-                return -1;
-            }
-        }
     };
 
     // Convert URL to URI if needed
@@ -2104,8 +2205,7 @@ pub extern "C" fn spotifly_play_uri(uri_or_url: *const c_char, track_index: i32)
                 Ok(_) => {
                     debug!("Spirc.load() succeeded");
                     IS_PLAYING.store(true, Ordering::SeqCst);
-                    IS_ACTIVE_DEVICE.store(true, Ordering::SeqCst);
-                    set_pending_play(PendingPlayRequest::Uri(uri_str.clone(), track_index));
+                    set_active_device(true);
                     0
                 }
                 Err(_e) => {
@@ -2129,31 +2229,14 @@ pub extern "C" fn spotifly_pause() -> i32 {
     if let Err(e) = require_session_connected() {
         return e;
     }
-    // Cancel any pending play — if the user pauses while a track is still loading,
-    // PlayerEvent::Playing will never fire, and a later soft-reconnect watchdog
-    // would otherwise replay something the user explicitly paused.
-    clear_pending_play();
-    let spirc_guard = SPIRC.lock().unwrap();
-    match spirc_guard.as_ref() {
-        Some(spirc) => match spirc.pause() {
-            Ok(_) => {
-                IS_PLAYING.store(false, Ordering::SeqCst);
-                0
-            }
-            Err(e) => {
-                debug!("Pause error: {:?}", e);
-                if is_channel_closed_error(&e) {
-                    ERROR_NEEDS_REINIT
-                } else {
-                    ERROR_GENERAL
-                }
-            }
-        },
-        None => {
-            debug!("Pause error: Spirc not initialized");
-            ERROR_GENERAL
-        }
-    }
+    // IS_PLAYING is cleared here rather than left to the event stream: the user can pause
+    // while a track is still loading, and in that case PlayerEvent::Playing never fires,
+    // so there is no playing-to-paused transition for the listener to report.
+    spirc_command("Pause", |spirc| {
+        spirc.pause()?;
+        IS_PLAYING.store(false, Ordering::SeqCst);
+        Ok(())
+    })
 }
 
 /// Clears any buffered audio samples.
@@ -2176,6 +2259,25 @@ fn wait_for_playing_event(previous_seq: u64, timeout_ms: u64) -> bool {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// How long rehydration waits for the Player to actually start before giving up on the
+/// wait (not on the session). Observed load-to-playing is around a second.
+const REHYDRATE_PLAYING_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Waits for the Player to report playback, without parking a runtime worker.
+///
+/// The blocking twin above is fine in synchronous FFI entry points; this one runs inside
+/// `init_player_async`, where a thread sleep would block a tokio worker thread.
+async fn wait_for_playing_event_async(previous_seq: u64, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if PLAYING_EVENT_SEQ.load(Ordering::SeqCst) > previous_seq {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    PLAYING_EVENT_SEQ.load(Ordering::SeqCst) > previous_seq
 }
 
 fn resume_via_load(spirc: &Arc<Spirc>) -> i32 {
@@ -2202,7 +2304,7 @@ fn resume_via_load(spirc: &Arc<Spirc>) -> i32 {
 
         match spirc.load(load_request) {
             Ok(_) => {
-                IS_ACTIVE_DEVICE.store(true, Ordering::SeqCst);
+                set_active_device(true);
                 return 0;
             }
             Err(e) => {
@@ -2230,7 +2332,7 @@ fn resume_via_load(spirc: &Arc<Spirc>) -> i32 {
 
         match spirc.load(load_request) {
             Ok(_) => {
-                IS_ACTIVE_DEVICE.store(true, Ordering::SeqCst);
+                set_active_device(true);
                 return 0;
             }
             Err(e) => {
@@ -2310,8 +2412,8 @@ pub extern "C" fn spotifly_resume() -> i32 {
 #[no_mangle]
 pub extern "C" fn spotifly_stop() -> i32 {
     debug!("spotifly_stop called");
-    // Cancel any pending play so the soft-reconnect watchdog doesn't re-issue it
-    clear_pending_play();
+    // Stops at the Player rather than through Spirc: this is a local teardown of
+    // playback, not a Connect command.
     let player_guard = PLAYER.lock().unwrap();
     match player_guard.as_ref() {
         Some(player) => {
@@ -2334,7 +2436,21 @@ pub extern "C" fn spotifly_shutdown() -> i32 {
     debug!("spotifly_shutdown called");
     // Prevent reconnection attempts during intentional shutdown
     SHUTTING_DOWN.store(true, Ordering::SeqCst);
-    clear_pending_play();
+
+    // Publish the truth now rather than waiting for the listeners to notice the channel
+    // close. A snapshot still claiming a connected session and a ready Spirc after an
+    // intentional shutdown is what lets Swift adopt the dead session as a healthy one — on
+    // logout that meant the next login skipped initialization and kept a closed Spirc.
+    // Notified outside the lock: the callback re-enters Swift.
+    with_connection(|c| {
+        c.spirc_ready = false;
+        c.session_connected = false;
+        c.session_connection_id = None;
+        c.connected_since_ms = 0;
+        c.last_error = Some("Shutdown requested".to_string());
+    });
+    notify_connection_state_change();
+
     let spirc_guard = SPIRC.lock().unwrap();
     if let Some(spirc) = spirc_guard.as_ref() {
         if spirc.shutdown().is_ok() {
@@ -2354,8 +2470,6 @@ pub extern "C" fn spotifly_disconnect() -> i32 {
     debug!("spotifly_disconnect called - disconnecting for sleep");
     // Set sleeping flag to prevent auto-reconnect when cluster listener ends
     SLEEPING.store(true, Ordering::SeqCst);
-    // Cancel any pending play - a play from before sleep must not replay on wake
-    clear_pending_play();
 
     let spirc_guard = SPIRC.lock().unwrap();
     if let Some(spirc) = spirc_guard.as_ref() {
@@ -2388,74 +2502,52 @@ pub extern "C" fn spotifly_disconnect() -> i32 {
 pub extern "C" fn spotifly_cleanup() {
     debug!("spotifly_cleanup called - clearing all state");
 
+    // Invalidate the current generation first, so anything already in flight — most
+    // importantly a reconnect loop sleeping between attempts — sees that what it was
+    // recovering no longer exists and abandons instead of rebuilding over the teardown.
+    let invalidated = SESSION_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    debug!("spotifly_cleanup invalidated generation, now {}", invalidated);
+
     // Signal event listener to stop
-    {
-        let mut tx_guard = PLAYER_EVENT_TX.lock().unwrap();
-        if let Some(tx) = tx_guard.take() {
-            let _ = tx.send(());
-        }
+    if let Some(tx) = PLAYER_EVENT_TX.lock().unwrap().take() {
+        let _ = tx.send(());
     }
 
     // Shutdown Spirc first - this terminates the spirc_task and closes the dealer
     shutdown_spirc("spotifly_cleanup");
 
     // Now clear Spirc reference
-    {
-        let mut spirc_guard = SPIRC.lock().unwrap();
-        *spirc_guard = None;
-    }
-    SPIRC_READY.store(false, Ordering::SeqCst);
-
-    // Clear player
-    {
-        let mut player_guard = PLAYER.lock().unwrap();
-        *player_guard = None;
-    }
+    *SPIRC.lock().unwrap() = None;
+    // Clear player (see do_reconnect_cleanup for why Swift is told first)
+    proxy_sink::ProxySink::notify_player_gone();
+    *PLAYER.lock().unwrap() = None;
 
     // Clear mixer
-    {
-        let mut mixer_guard = MIXER.lock().unwrap();
-        *mixer_guard = None;
-    }
+    *MIXER.lock().unwrap() = None;
 
     // Clear session
-    {
-        let mut session_guard = SESSION.lock().unwrap();
-        *session_guard = None;
-    }
-
-    // Clear device ID
-    {
-        let mut device_id_guard = DEVICE_ID.lock().unwrap();
-        *device_id_guard = None;
-    }
+    *SESSION.lock().unwrap() = None;
 
     // Reset state flags
     IS_PLAYING.store(false, Ordering::SeqCst);
-    IS_ACTIVE_DEVICE.store(false, Ordering::SeqCst);
+    set_active_device(false);
     SHUFFLE_STATE.store(false, Ordering::SeqCst);
-    clear_pending_play();
     REPEAT_TRACK_STATE.store(false, Ordering::SeqCst);
     REPEAT_CONTEXT_STATE.store(false, Ordering::SeqCst);
     POSITION_MS.store(0, Ordering::SeqCst);
-    POSITION_TIMESTAMP_MS.store(0, Ordering::SeqCst);
     LAST_VOLUME.store(0, Ordering::SeqCst);
-    {
-        let mut last_device = LAST_ACTIVE_DEVICE_ID.lock().unwrap();
-        last_device.clear();
-    }
+    LAST_ACTIVE_DEVICE_ID.lock().unwrap().clear();
 
-    // Reset session connection state
-    {
-        let mut state = SESSION_CONNECTION_STATE.lock().unwrap();
-        state.is_connected = false;
-        state.connection_id = None;
-    }
-
-    // Reset connection state tracking (but keep reconnect_attempt for backoff)
-    CONNECTED_SINCE_MS.store(0, Ordering::SeqCst);
-    // Note: We don't reset RECONNECT_ATTEMPT here - it's used for exponential backoff
-    // and should only be reset on successful reconnect (in SessionConnected handler)
+    // Reset the connection snapshot: not ready, not connected, no device ID.
+    // reconnect_attempt is deliberately preserved - it drives exponential backoff and
+    // is only reset on a successful connect (in the SessionConnected handler).
+    with_connection(|c| {
+        c.spirc_ready = false;
+        c.session_connected = false;
+        c.session_connection_id = None;
+        c.device_id = None;
+        c.connected_since_ms = 0;
+    });
 
     // Notify connection state change
     notify_connection_state_change();
@@ -2466,46 +2558,23 @@ pub extern "C" fn spotifly_cleanup() {
 /// Returns 1 if currently playing, 0 otherwise.
 #[no_mangle]
 pub extern "C" fn spotifly_is_playing() -> i32 {
-    if IS_PLAYING.load(Ordering::SeqCst) {
-        1
-    } else {
-        0
-    }
+    i32::from(IS_PLAYING.load(Ordering::SeqCst))
 }
 
 /// Returns 1 if this device is the active Spotify Connect device, 0 otherwise.
 /// When not active, playback controls should use Web API instead of Spirc.
 #[no_mangle]
 pub extern "C" fn spotifly_is_active_device() -> i32 {
-    if IS_ACTIVE_DEVICE.load(Ordering::SeqCst) {
-        1
-    } else {
-        0
-    }
+    i32::from(is_active_device())
 }
 
-/// Returns the current playback position in milliseconds.
-/// If playing, interpolates from last known position.
-/// Returns 0 if not playing or no position available.
+/// Returns the last position reported by the Player.
+///
+/// Swift owns display interpolation. Interpolating here as well used to add up to five
+/// seconds after Player events stopped, while reconnect rehydration correctly resumed from
+/// this raw position. The two clocks therefore produced an exact five-second snap backwards.
 fn current_position_ms() -> u32 {
-    let stored_position = POSITION_MS.load(Ordering::SeqCst);
-    let stored_timestamp = POSITION_TIMESTAMP_MS.load(Ordering::SeqCst);
-
-    if stored_timestamp == 0 {
-        return 0;
-    }
-
-    // If playing, interpolate position from last update
-    if IS_PLAYING.load(Ordering::SeqCst) {
-        let now = current_timestamp_ms();
-        let elapsed_since_update = now.saturating_sub(stored_timestamp);
-        // Cap interpolation at 5 seconds - librespot events can be delayed
-        // but if we haven't heard anything in 5s, something is wrong
-        let capped_elapsed = elapsed_since_update.min(5000) as u32;
-        stored_position.saturating_add(capped_elapsed)
-    } else {
-        stored_position
-    }
+    POSITION_MS.load(Ordering::SeqCst)
 }
 
 #[no_mangle]
@@ -2521,24 +2590,7 @@ pub extern "C" fn spotifly_next() -> i32 {
     if let Err(e) = require_session_connected() {
         return e;
     }
-    let spirc_guard = SPIRC.lock().unwrap();
-    match spirc_guard.as_ref() {
-        Some(spirc) => match spirc.next() {
-            Ok(_) => 0,
-            Err(e) => {
-                debug!("Next error: {:?}", e);
-                if is_channel_closed_error(&e) {
-                    ERROR_NEEDS_REINIT
-                } else {
-                    ERROR_GENERAL
-                }
-            }
-        },
-        None => {
-            debug!("Next error: Spirc not initialized");
-            ERROR_GENERAL
-        }
-    }
+    spirc_command("Next", |spirc| spirc.next())
 }
 
 /// Skips to the previous track in the queue.
@@ -2549,24 +2601,7 @@ pub extern "C" fn spotifly_previous() -> i32 {
     if let Err(e) = require_session_connected() {
         return e;
     }
-    let spirc_guard = SPIRC.lock().unwrap();
-    match spirc_guard.as_ref() {
-        Some(spirc) => match spirc.prev() {
-            Ok(_) => 0,
-            Err(e) => {
-                debug!("Previous error: {:?}", e);
-                if is_channel_closed_error(&e) {
-                    ERROR_NEEDS_REINIT
-                } else {
-                    ERROR_GENERAL
-                }
-            }
-        },
-        None => {
-            debug!("Previous error: Spirc not initialized");
-            ERROR_GENERAL
-        }
-    }
+    spirc_command("Previous", |spirc| spirc.prev())
 }
 
 /// Seeks to the given position in milliseconds.
@@ -2577,24 +2612,7 @@ pub extern "C" fn spotifly_seek(position_ms: u32) -> i32 {
     if let Err(e) = require_session_connected() {
         return e;
     }
-    let spirc_guard = SPIRC.lock().unwrap();
-    match spirc_guard.as_ref() {
-        Some(spirc) => match spirc.set_position_ms(position_ms) {
-            Ok(_) => 0,
-            Err(e) => {
-                debug!("Seek error: {:?}", e);
-                if is_channel_closed_error(&e) {
-                    ERROR_NEEDS_REINIT
-                } else {
-                    ERROR_GENERAL
-                }
-            }
-        },
-        None => {
-            debug!("Seek error: Spirc not initialized");
-            ERROR_GENERAL
-        }
-    }
+    spirc_command("Seek", |spirc| spirc.set_position_ms(position_ms))
 }
 
 /// Async core of radio playback. Safe to call from both sync (via block_on) and async contexts.
@@ -2675,8 +2693,7 @@ async fn play_radio_async(uri_str: &str) -> i32 {
             );
             match spirc.load(load_request) {
                 Ok(_) => {
-                    IS_ACTIVE_DEVICE.store(true, Ordering::SeqCst);
-                    set_pending_play(PendingPlayRequest::Radio(uri_str.to_string()));
+                    set_active_device(true);
                     0
                 }
                 Err(_e) => {
@@ -2697,19 +2714,9 @@ async fn play_radio_async(uri_str: &str) -> i32 {
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
 pub extern "C" fn spotifly_play_radio(track_uri: *const c_char) -> i32 {
-    if track_uri.is_null() {
-        debug!("Play radio error: track_uri is null");
+    let Some(uri_str) = (unsafe { c_string_arg(track_uri) }) else {
+        debug!("Play radio error: track_uri is null or not valid UTF-8");
         return -1;
-    }
-
-    let uri_str = unsafe {
-        match CStr::from_ptr(track_uri).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                debug!("Play radio error: invalid track_uri string");
-                return -1;
-            }
-        }
     };
 
     debug!("spotifly_play_radio called: {}", uri_str);
@@ -2725,24 +2732,7 @@ pub extern "C" fn spotifly_set_volume(volume: u16) -> i32 {
     if let Err(e) = require_session_connected() {
         return e;
     }
-    let spirc_guard = SPIRC.lock().unwrap();
-    match spirc_guard.as_ref() {
-        Some(spirc) => match spirc.set_volume(volume) {
-            Ok(_) => 0,
-            Err(e) => {
-                debug!("Set volume error: {:?}", e);
-                if is_channel_closed_error(&e) {
-                    ERROR_NEEDS_REINIT
-                } else {
-                    ERROR_GENERAL
-                }
-            }
-        },
-        None => {
-            debug!("Set volume error: Spirc not initialized");
-            ERROR_GENERAL
-        }
-    }
+    spirc_command("Set volume", |spirc| spirc.set_volume(volume))
 }
 
 /// Sets shuffle mode on the current playback context.
@@ -2753,24 +2743,7 @@ pub extern "C" fn spotifly_set_shuffle(enabled: bool) -> i32 {
     if let Err(e) = require_session_connected() {
         return e;
     }
-    let spirc_guard = SPIRC.lock().unwrap();
-    match spirc_guard.as_ref() {
-        Some(spirc) => match spirc.shuffle(enabled) {
-            Ok(_) => 0,
-            Err(e) => {
-                debug!("Set shuffle error: {:?}", e);
-                if is_channel_closed_error(&e) {
-                    ERROR_NEEDS_REINIT
-                } else {
-                    ERROR_GENERAL
-                }
-            }
-        },
-        None => {
-            debug!("Set shuffle error: Spirc not initialized");
-            ERROR_GENERAL
-        }
-    }
+    spirc_command("Set shuffle", |spirc| spirc.shuffle(enabled))
 }
 
 /// Sets the streaming bitrate.
@@ -2862,19 +2835,9 @@ pub extern "C" fn spotifly_transfer_to_local() -> i32 {
 /// - to_device_id: The target device ID to transfer playback to
 #[no_mangle]
 pub extern "C" fn spotifly_transfer_playback(to_device_id: *const c_char) -> i32 {
-    if to_device_id.is_null() {
-        debug!("Transfer playback error: to_device_id is null");
+    let Some(to_device_str) = (unsafe { c_string_arg(to_device_id) }) else {
+        debug!("Transfer playback error: to_device_id is null or not valid UTF-8");
         return -1;
-    }
-
-    let to_device_str = unsafe {
-        match CStr::from_ptr(to_device_id).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                debug!("Transfer playback error: invalid to_device_id string");
-                return -1;
-            }
-        }
     };
 
     debug!("spotifly_transfer_playback called: {}", to_device_str);
@@ -2893,15 +2856,23 @@ pub extern "C" fn spotifly_transfer_playback(to_device_id: *const c_char) -> i32
     };
     drop(session_guard);
 
-    let device_id_guard = DEVICE_ID.lock().unwrap();
-    let from_device_id = match device_id_guard.as_ref() {
-        Some(id) => id.clone(),
+    // Deliberately our own device ID, not the cluster's active device. The endpoint is
+    // POST /connect-state/v1/connect/transfer/from/{from}/to/{to}, and the backend derives
+    // the source from the session rather than validating this segment: librespot itself
+    // passes its own ID for *both* sides in the transfer-to-local path, in the branch that
+    // only runs while it is not the active device (Spirc::handle_command, SpircCommand::
+    // Transfer). Verified by hand too — Spotifly -> iPhone -> a Connect speaker chains
+    // fine, each hop sourced from an already-inactive Spotifly.
+    //
+    // So passing the cluster's active device here would trade a value that is always known
+    // for one that lags the dealer websocket by a few hundred milliseconds, and buy nothing.
+    let from_device_id = match current_device_id() {
+        Some(id) => id,
         None => {
             debug!("Transfer playback error: device ID not initialized");
             return -1;
         }
     };
-    drop(device_id_guard);
 
     let result: Result<(), String> = RUNTIME.block_on(async {
         session
@@ -2920,7 +2891,7 @@ pub extern "C" fn spotifly_transfer_playback(to_device_id: *const c_char) -> i32
                 player.pause();
             }
             IS_PLAYING.store(false, Ordering::SeqCst);
-            IS_ACTIVE_DEVICE.store(false, Ordering::SeqCst);
+            set_active_device(false);
             0
         }
         Err(_e) => {
@@ -2933,30 +2904,16 @@ pub extern "C" fn spotifly_transfer_playback(to_device_id: *const c_char) -> i32
 /// Returns 1 if Spirc is initialized and connected to Spotify Connect, 0 otherwise.
 #[no_mangle]
 pub extern "C" fn spotifly_is_spirc_ready() -> i32 {
-    if SPIRC_READY.load(Ordering::SeqCst) {
-        1
-    } else {
-        0
-    }
+    i32::from(with_connection(|c| c.spirc_ready))
 }
 
 /// Adds an item to the queue.
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
 pub extern "C" fn spotifly_add_to_queue(uri: *const c_char) -> i32 {
-    if uri.is_null() {
-        debug!("Add to queue error: uri is null");
+    let Some(uri_str) = (unsafe { c_string_arg(uri) }) else {
+        debug!("Add to queue error: uri is null or not valid UTF-8");
         return -1;
-    }
-
-    let uri_str = unsafe {
-        match CStr::from_ptr(uri).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                debug!("Add to queue error: invalid uri string");
-                return -1;
-            }
-        }
     };
 
     debug!("[Spotifly] spotifly_add_to_queue called: {}", uri_str);
@@ -2990,5 +2947,184 @@ pub extern "C" fn spotifly_add_to_queue(uri: *const c_char) -> i32 {
             debug!("Add to queue error: Spirc not initialized");
             -1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Recovery must start from transport evidence, not from Connect activity. These cover
+    // the distinction that P0.1 was about: librespot emits the same deactivation event for
+    // an ordinary handoff and for an unexpected Spirc shutdown.
+
+    #[test]
+    fn deactivation_alone_does_not_recover() {
+        // Another device took over. The session is fine — do not reconnect.
+        assert!(!should_recover_after_deactivation(false, false));
+    }
+
+    #[test]
+    fn deactivation_with_dead_session_recovers() {
+        // librespot calls handle_disconnect on unexpected Spirc shutdown; the cluster
+        // listener can miss that while the dealer stream is still open.
+        assert!(should_recover_after_deactivation(true, false));
+    }
+
+    #[test]
+    fn deactivation_during_teardown_never_recovers() {
+        // Sleep and shutdown disconnect on purpose; recovering would fight them.
+        assert!(!should_recover_after_deactivation(true, true));
+        assert!(!should_recover_after_deactivation(false, true));
+    }
+
+    // A listener or loop belonging to a replaced session must not act. Before the rewrite
+    // this could not be expressed: one event listener survived across sessions, so its
+    // generation was rewritten in place and the staleness check compared two values that
+    // were always equal.
+
+    #[test]
+    fn a_superseded_listener_is_rejected() {
+        // The replacement is installed while the old listener is still draining.
+        assert!(!listener_may_act(3, 4));
+    }
+
+    #[test]
+    fn the_current_listener_acts() {
+        assert!(listener_may_act(4, 4));
+    }
+
+    #[test]
+    fn a_reconnect_loop_abandons_after_its_generation_moves() {
+        // A restart landed while the loop slept between attempts; rebuilding now would
+        // replace a healthy new session with one built from a stale token.
+        assert!(!reconnect_may_proceed(2, 3, false));
+    }
+
+    #[test]
+    fn a_reconnect_loop_abandons_during_teardown() {
+        assert!(!reconnect_may_proceed(2, 2, true));
+    }
+
+    #[test]
+    fn a_reconnect_loop_does_not_abandon_because_of_its_own_rebuild() {
+        // Regression: each attempt calls init_player_async, which bumps the generation
+        // before it can fail. Comparing against the value captured at loop start made the
+        // loop read its own rebuild as a foreign supersede and give up after one attempt,
+        // killing the remaining nine backoff retries — and with the Player already torn
+        // down by the preceding cleanup, playback stayed dead for the whole outage.
+        let mut recovering = 2;
+        let after_own_failed_attempt = 3; // init_player_async bumped it, then errored
+        assert!(!reconnect_may_proceed(
+            recovering,
+            after_own_failed_attempt,
+            false
+        ));
+
+        // Adopting the generation our own attempt produced is what keeps the loop alive.
+        recovering = after_own_failed_attempt;
+        assert!(reconnect_may_proceed(
+            recovering,
+            after_own_failed_attempt,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_reconnect_loop_still_abandons_on_a_foreign_rebuild() {
+        // Adopting our own bump must not blind the loop to someone else's.
+        let recovering = 3; // adopted after our own attempt
+        assert!(!reconnect_may_proceed(recovering, 4, false));
+    }
+
+    #[test]
+    fn a_reconnect_loop_proceeds_for_its_own_generation() {
+        assert!(reconnect_may_proceed(2, 2, false));
+    }
+
+    // The periodic health check is the only thing watching while Spotifly is idle, so its
+    // trigger has to cover more than a session that reports itself invalid.
+
+    // Only local playback is rehydrated, and the intent has to be captured before the
+    // disconnect handling clears it.
+
+    #[test]
+    fn local_playback_is_resumed() {
+        assert!(RecoveryIntent { was_playing: true, was_active: true }.should_resume());
+    }
+
+    #[test]
+    fn remote_playback_is_left_alone() {
+        // Another device is still playing; taking over would steal it from the user.
+        assert!(!RecoveryIntent { was_playing: true, was_active: false }.should_resume());
+    }
+
+    #[test]
+    fn a_paused_local_player_is_not_resumed() {
+        assert!(!RecoveryIntent { was_playing: false, was_active: true }.should_resume());
+    }
+
+    #[test]
+    fn health_check_recovers_a_dead_session() {
+        assert!(health_check_should_recover(true, false, false, false));
+    }
+
+    #[test]
+    fn health_check_recovers_a_session_that_never_connected() {
+        // Regression: Session::is_invalid is only set by shutdown(), so a session left
+        // behind by a failed init reports valid forever. Before this, nothing retried —
+        // the Swift watchdog used to paper over it by rebuilding every 120s, and removing
+        // that watchdog exposed the gap at both startup and after a failed rebuild.
+        assert!(health_check_should_recover(false, false, false, false));
+    }
+
+    #[test]
+    fn health_check_leaves_a_healthy_session_alone() {
+        assert!(!health_check_should_recover(false, true, false, false));
+    }
+
+    #[test]
+    fn health_check_defers_to_a_running_reconnect() {
+        // The loop is what fixes this; firing alongside it would just re-publish a
+        // disconnected snapshot once a minute.
+        assert!(!health_check_should_recover(true, false, true, false));
+    }
+
+    #[test]
+    fn health_check_stays_out_of_a_teardown() {
+        assert!(!health_check_should_recover(true, false, false, true));
+    }
+
+    #[test]
+    fn only_the_current_cluster_listener_recovers() {
+        assert!(should_recover_after_cluster_end(7, 7, false));
+        // An older listener ending is the expected result of its session being replaced.
+        assert!(!should_recover_after_cluster_end(6, 7, false));
+        assert!(!should_recover_after_cluster_end(7, 7, true));
+    }
+
+    // Active-device state is derived from the cluster rather than inferred from whichever
+    // command ran last (P1.3).
+
+    #[test]
+    fn cluster_naming_us_makes_us_active() {
+        assert!(is_active_in_cluster("spotifly_1234", Some("spotifly_1234")));
+    }
+
+    #[test]
+    fn cluster_naming_another_device_makes_us_inactive() {
+        assert!(!is_active_in_cluster("phone-abc", Some("spotifly_1234")));
+    }
+
+    #[test]
+    fn empty_active_device_clears_activity() {
+        // "Nothing is playing anywhere" is a real state, not a missing value.
+        assert!(!is_active_in_cluster("", Some("spotifly_1234")));
+    }
+
+    #[test]
+    fn no_local_device_id_is_never_active() {
+        assert!(!is_active_in_cluster("phone-abc", None));
+        assert!(!is_active_in_cluster("", None));
     }
 }
