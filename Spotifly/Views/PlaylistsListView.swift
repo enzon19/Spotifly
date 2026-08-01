@@ -102,7 +102,7 @@ struct PlaylistsListView: View {
                                     playbackViewModel: playbackViewModel,
                                     isSelected: navigationCoordinator.selectedPlaylistId == playlist.id,
                                     onSelect: {
-                                        navigationCoordinator.selectedPlaylistId = playlist.id
+                                        navigationCoordinator.selectPlaylist(playlist.id)
                                     },
                                 )
                             }
@@ -125,9 +125,7 @@ struct PlaylistsListView: View {
                                     playbackViewModel: playbackViewModel,
                                     isSelected: navigationCoordinator.selectedPlaylistId == playlist.id,
                                     onSelect: {
-                                        // Clear ephemeral state when user selects a library playlist
-                                        navigationCoordinator.viewingPlaylistId = nil
-                                        navigationCoordinator.selectedPlaylistId = playlist.id
+                                        navigationCoordinator.selectPlaylist(playlist.id)
                                     },
                                 )
 
@@ -160,25 +158,19 @@ struct PlaylistsListView: View {
             if store.userPlaylists.isEmpty, !store.playlistsPagination.isLoading {
                 await loadPlaylists()
             }
-            // Always sync selection with viewing playlist ID (handles navigation from other sections)
-            if let viewingId = navigationCoordinator.viewingPlaylistId {
-                navigationCoordinator.selectedPlaylistId = viewingId
-            } else if navigationCoordinator.selectedPlaylistId == nil, let first = store.userPlaylists.first {
-                // No ephemeral playlist, select first user playlist
-                navigationCoordinator.selectedPlaylistId = first.id
-            }
+            selectFirstPlaylistIfNeeded()
         }
-        .onChange(of: navigationCoordinator.viewingPlaylistId) { _, newId in
-            // Auto-select the ephemeral playlist when it's set
-            if let id = newId {
-                navigationCoordinator.selectedPlaylistId = id
-            }
+        .onChange(of: store.userPlaylists) { _, _ in
+            selectFirstPlaylistIfNeeded()
         }
-        .onChange(of: store.userPlaylists) { _, playlists in
-            if navigationCoordinator.selectedPlaylistId == nil, ephemeralPlaylist == nil, let first = playlists.first {
-                navigationCoordinator.selectedPlaylistId = first.id
-            }
-        }
+    }
+
+    /// The section always shows a detail, so entering it lands on the first playlist. The
+    /// coordinator is told at this call site that the step is automatic, so it replaces the
+    /// route rather than recording a history entry the user never asked for.
+    private func selectFirstPlaylistIfNeeded() {
+        guard navigationCoordinator.selectedPlaylistId == nil, let first = store.userPlaylists.first else { return }
+        navigationCoordinator.selectPlaylist(first.id, recordsHistory: false)
     }
 
     private func loadPlaylists(forceRefresh: Bool = false) async {

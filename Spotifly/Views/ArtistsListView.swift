@@ -102,7 +102,7 @@ struct ArtistsListView: View {
                                     playbackViewModel: playbackViewModel,
                                     isSelected: navigationCoordinator.selectedArtistId == artist.id,
                                     onSelect: {
-                                        navigationCoordinator.selectedArtistId = artist.id
+                                        navigationCoordinator.selectArtist(artist.id)
                                     },
                                 )
                             }
@@ -126,9 +126,7 @@ struct ArtistsListView: View {
                                     playbackViewModel: playbackViewModel,
                                     isSelected: navigationCoordinator.selectedArtistId == artist.id,
                                     onSelect: {
-                                        // Clear ephemeral state when user selects a library artist
-                                        navigationCoordinator.viewingArtistId = nil
-                                        navigationCoordinator.selectedArtistId = artist.id
+                                        navigationCoordinator.selectArtist(artist.id)
                                     },
                                 )
 
@@ -161,25 +159,19 @@ struct ArtistsListView: View {
             if store.userArtists.isEmpty, !store.artistsPagination.isLoading {
                 await loadArtists()
             }
-            // Always sync selection with viewing artist ID (handles navigation from other sections)
-            if let viewingId = navigationCoordinator.viewingArtistId {
-                navigationCoordinator.selectedArtistId = viewingId
-            } else if navigationCoordinator.selectedArtistId == nil, let first = store.userArtists.first {
-                // No ephemeral artist, select first user artist
-                navigationCoordinator.selectedArtistId = first.id
-            }
+            selectFirstArtistIfNeeded()
         }
-        .onChange(of: navigationCoordinator.viewingArtistId) { _, newId in
-            // Auto-select the ephemeral artist when it's set
-            if let id = newId {
-                navigationCoordinator.selectedArtistId = id
-            }
+        .onChange(of: store.userArtists) { _, _ in
+            selectFirstArtistIfNeeded()
         }
-        .onChange(of: store.userArtists) { _, artists in
-            if navigationCoordinator.selectedArtistId == nil, ephemeralArtist == nil, let first = artists.first {
-                navigationCoordinator.selectedArtistId = first.id
-            }
-        }
+    }
+
+    /// The section always shows a detail, so entering it lands on the first artist. The
+    /// coordinator is told at this call site that the step is automatic, so it replaces the
+    /// route rather than recording a history entry the user never asked for.
+    private func selectFirstArtistIfNeeded() {
+        guard navigationCoordinator.selectedArtistId == nil, let first = store.userArtists.first else { return }
+        navigationCoordinator.selectArtist(first.id, recordsHistory: false)
     }
 
     private func loadArtists(forceRefresh: Bool = false) async {
