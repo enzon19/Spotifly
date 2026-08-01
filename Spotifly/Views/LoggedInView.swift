@@ -53,15 +53,14 @@ struct LoggedInView: View {
         _playlistService = State(initialValue: PlaylistService(store: store, tokenProvider: tokenProvider))
         _albumService = State(initialValue: AlbumService(store: store, tokenProvider: tokenProvider))
         _artistService = State(initialValue: ArtistService(store: store, tokenProvider: tokenProvider))
-        _queueService = State(initialValue: QueueService(store: store, tokenProvider: tokenProvider))
+        let trackService = TrackService(store: store, tokenProvider: tokenProvider)
+        _queueService = State(initialValue: QueueService(store: store, tokenProvider: tokenProvider, trackService: trackService))
         _connectionService = State(initialValue: ConnectionService(store: store))
         _deviceService = State(initialValue: DeviceService(store: store))
         _navigationCoordinator = State(initialValue: NavigationCoordinator(store: store))
-        _trackService = State(initialValue: TrackService(store: store, tokenProvider: tokenProvider))
+        _trackService = State(initialValue: trackService)
         _recentlyPlayedService = State(initialValue: RecentlyPlayedService(store: store))
         _topItemsService = State(initialValue: TopItemsService(store: store))
-
-        playbackViewModel.setStore(store)
     }
 
     @AppStorage("topItemsTimeRange") private var topItemsTimeRange: String = TopItemsTimeRange.mediumTerm.rawValue
@@ -185,6 +184,7 @@ struct LoggedInView: View {
             playbackViewModel: playbackViewModel,
             queueService: queueService,
             deviceService: deviceService,
+            connectionService: connectionService,
             recentlyPlayedService: recentlyPlayedService,
             topItemsService: topItemsService,
             blockingState: $blockingState,

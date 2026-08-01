@@ -69,6 +69,9 @@ struct NowPlayingBarView: View {
                 Text("playlist.new.message")
             }
             .task(id: currentTrackId) {
+                await resolveCurrentTrackMetadataIfNeeded()
+            }
+            .task(id: currentTrackId) {
                 await resolveCurrentTrackFavoriteStatusIfNeeded()
             }
     }
@@ -282,12 +285,12 @@ struct NowPlayingBarView: View {
         playbackViewModel.interpolatedPositionMs
     }
 
-    /// Current track duration (from store, fallback to playback state)
+    /// Current track duration (from playback state, fallback to store metadata)
     private var currentDurationMs: UInt32 {
-        if let track = currentTrack {
-            return UInt32(track.durationMs)
+        if playbackViewModel.trackDurationMs > 0 {
+            return playbackViewModel.trackDurationMs
         }
-        return playbackViewModel.trackDurationMs
+        return currentTrack.map { UInt32($0.durationMs) } ?? 0
     }
 
     private var progressBar: some View {
@@ -368,6 +371,19 @@ struct NowPlayingBarView: View {
                 .foregroundStyle(isCurrentTrackFavorited ? .red : .secondary)
         }
         .buttonStyle(.plain)
+    }
+
+    private func resolveCurrentTrackMetadataIfNeeded() async {
+        guard let trackId = currentTrackId else { return }
+
+        do {
+            try await trackService.ensureTracksLoaded(trackIds: [trackId])
+            // The task may have outlived this ID. The update is still safe because it
+            // resolves PlaybackViewModel's current logical URI rather than `trackId`.
+            playbackViewModel.updateNowPlayingInfo()
+        } catch {
+            debugLog("NowPlayingBarView", "Failed to load metadata for \(trackId): \(error)")
+        }
     }
 
     private func resolveCurrentTrackFavoriteStatusIfNeeded() async {

@@ -2,7 +2,7 @@
 //  TrackService.swift
 //  Spotifly
 //
-//  Service for track-related operations including favorites.
+//  Shared service for track metadata and favorite operations.
 //  Handles API calls and updates AppStore on success.
 //
 
@@ -21,26 +21,27 @@ final class TrackService {
     /// Injectable for tests; production uses Spotify's batched contains endpoint.
     private let favoriteStatusFetcher: (_ accessToken: String, _ trackIds: [String]) async throws -> [String: Bool]
 
+    /// The single metadata fetch path shared by queue hydration and current-track recovery.
+    private let metadataFetcher: (_ accessToken: String, _ trackIds: [String]) async throws -> [String: APITrack]
+
     /// The favorites list, whose pages are one run at a time under one key.
     private let listRequests = InFlightRequests<Void>()
     private static let listKey = "favorites"
 
-    /// Track IDs with a `/me/tracks/contains` check already on its way.
+    /// `/me/tracks/contains` checks, deduplicated per track ID.
+    private let statusChecks = BatchInFlightRequests()
+
+    /// `/v1/tracks` metadata loads, deduplicated per track ID.
+    private let metadataLoads = BatchInFlightRequests()
+
+    /// Track IDs a *successful* request came back without.
     ///
-    /// The resolved-status cache alone does not prevent duplicates: it is only
-    /// written when a check *returns*, so two views asking about the same track in
-    /// the same frame — a row and the now-playing bar, say — both see it unresolved
-    /// and both ask. Keeping the task, rather than just a busy marker, also lets the
-    /// second caller await the result. The task is unstructured, so cancellation of
-    /// the SwiftUI task that started it does not strand the replacement view.
-    ///
-    /// This is deliberately not `InFlightRequests`, even though it wants the same two
-    /// guarantees. That registry maps one key to one run; a `contains` request covers
-    /// *many* tracks, and the next caller arrives with an overlapping but different
-    /// set — it has to join the runs already carrying some of its tracks and start one
-    /// for the rest. Folding the two together would mean teaching the registry a
-    /// many-to-one key relation it does not have, to save a dictionary and a `defer`.
-    private var checksInFlight: [String: (id: UUID, task: Task<Void, Never>)] = [:]
+    /// The store can only cache what Spotify returned, so an ID that does not resolve for
+    /// this user's market stays absent and passes the missing-from-store filter forever.
+    /// A playlist holding a few such tracks would otherwise pay for them again on every
+    /// queue update. Only a response that arrived marks an ID here — a thrown request
+    /// leaves it eligible, so a network failure still retries.
+    private var unavailableTrackIds: Set<String> = []
 
     init(
         store: AppStore,
@@ -48,10 +49,36 @@ final class TrackService {
         favoriteStatusFetcher: @escaping (_ accessToken: String, _ trackIds: [String]) async throws -> [String: Bool] = { accessToken, trackIds in
             try await SpotifyAPI.checkSavedTracks(accessToken: accessToken, trackIds: trackIds)
         },
+        metadataFetcher: @escaping (_ accessToken: String, _ trackIds: [String]) async throws -> [String: APITrack] = { accessToken, trackIds in
+            try await SpotifyAPI.fetchTracks(accessToken: accessToken, trackIds: trackIds)
+        },
     ) {
         self.store = store
         self.tokenProvider = tokenProvider
         self.favoriteStatusFetcher = favoriteStatusFetcher
+        self.metadataFetcher = metadataFetcher
+    }
+
+    // MARK: - Track Metadata
+
+    /// Ensures every available track in `trackIds` is present in the normalized store.
+    ///
+    /// Cache hits return before requesting a token. Overlapping callers join any request
+    /// already carrying an ID and fetch only the uncovered remainder. A failed run removes
+    /// its entries, so a later call retries normally, while an ID Spotify answered without
+    /// is not asked for again.
+    func ensureTracksLoaded(trackIds: [String]) async throws {
+        let missingTrackIds = uniqueTrackIds(trackIds).filter {
+            store.tracks[$0] == nil && !unavailableTrackIds.contains($0)
+        }
+        guard !missingTrackIds.isEmpty else { return }
+
+        try await metadataLoads.run(missingTrackIds) { uncoveredTrackIds in
+            let accessToken = await self.tokenProvider()
+            let fetched = try await self.metadataFetcher(accessToken, uncoveredTrackIds)
+            self.store.upsertTracks(uncoveredTrackIds.compactMap { fetched[$0] }.map { Track(from: $0) })
+            self.unavailableTrackIds.formUnion(uncoveredTrackIds.filter { fetched[$0] == nil })
+        }
     }
 
     // MARK: - Favorites (Saved Tracks)
@@ -185,45 +212,13 @@ final class TrackService {
     private func check(_ trackIds: [String]) async {
         guard !trackIds.isEmpty else { return }
 
-        var tasks: [(id: UUID, task: Task<Void, Never>)] = []
-        var seenTaskIds = Set<UUID>()
-        var uncheckedTrackIds: [String] = []
-
-        for trackId in trackIds {
-            if let existing = checksInFlight[trackId] {
-                if seenTaskIds.insert(existing.id).inserted {
-                    tasks.append(existing)
-                }
-            } else {
-                uncheckedTrackIds.append(trackId)
+        // A failed check is not worth reporting — the heart just stays as it was — so
+        // the run swallows its own errors and `run` has nothing left to throw.
+        try? await statusChecks.run(trackIds) { uncheckedTrackIds in
+            let accessToken = await self.tokenProvider()
+            for batch in self.batches(of: uncheckedTrackIds, size: 50) {
+                try? await self.checkFavoriteStatuses(trackIds: batch, accessToken: accessToken)
             }
-        }
-
-        if !uncheckedTrackIds.isEmpty {
-            let id = UUID()
-            let task = Task { @MainActor in
-                defer { self.finishFavoriteCheck(id: id, trackIds: uncheckedTrackIds) }
-
-                let accessToken = await self.tokenProvider()
-                for batch in self.batches(of: uncheckedTrackIds, size: 50) {
-                    try? await self.checkFavoriteStatuses(trackIds: batch, accessToken: accessToken)
-                }
-            }
-            let entry = (id, task)
-            for trackId in uncheckedTrackIds {
-                checksInFlight[trackId] = entry
-            }
-            tasks.append(entry)
-        }
-
-        for entry in tasks {
-            await entry.task.value
-        }
-    }
-
-    private func finishFavoriteCheck(id: UUID, trackIds: [String]) {
-        for trackId in trackIds where checksInFlight[trackId]?.id == id {
-            checksInFlight[trackId] = nil
         }
     }
 
