@@ -107,6 +107,7 @@
 
 /* Queue */
 "queue.title" = "Warteschlange";
+"queue.open" = "Warteschlange öffnen";
 "queue.playing_from" = "Wiedergabe von";
 "queue.on_device" = "auf";
 "queue.song_count %lld %lld" = "%lld Songs (%lld ausstehend)";

@@ -287,12 +287,33 @@ final class QueueService {
 
     // MARK: - Initial State Fetch
 
+    /// Whether a Web API bootstrap response says anything at all about playback.
+    ///
+    /// Spotify answers both `/me/player` and `/me/player/queue` with 204 when no device is
+    /// active, and those decode to a nil state and an empty queue — indistinguishable from a
+    /// genuinely empty queue. It is the *absence of an answer*, not an answer that nothing is
+    /// queued, and the difference decides whether the queue survives a reconnect.
+    ///
+    /// Applying it is worse than it looks, because `AppStore.setQueue`'s `previous: nil`
+    /// contract splits the queue the wrong way round: the history is preserved and the
+    /// pending tracks — the one part no later callback reconstructs — are destroyed, along
+    /// with the current pointer that `Queue.reconciled` then cannot repair, because it can
+    /// only re-split a list that still contains the track.
+    static func responseCarriesPlayback(
+        playbackState: SpotifyAPI.PlaybackStateResponse?,
+        queueResponse: SpotifyAPI.QueueResponse,
+    ) -> Bool {
+        playbackState != nil
+            || queueResponse.currentlyPlaying != nil
+            || !queueResponse.queue.isEmpty
+    }
+
     /// Fetches initial playback state and queue from Web API.
     /// Called after Spirc becomes ready to sync with whatever device is currently playing.
     /// Mercury only receives push updates, so we need this to get the current state.
     ///
-    /// - Returns: `false` when nothing was applied, either because the request failed or
-    ///   because live state from Rust advanced while it was in flight. Most callers can
+    /// - Returns: `false` when nothing was applied: the request failed, live state from Rust
+    ///   advanced while it was in flight, or the response carried no playback at all. Most callers can
     ///   ignore that — a discarded response means the live callbacks already told Swift
     ///   what it was about to learn. Whether the queue *contents* changed is not a usable
     ///   substitute: a provisional `SetQueue` preserves the previous queue, so a discarded
@@ -319,6 +340,11 @@ final class QueueService {
                     "QueueService",
                     "Discarding Web API bootstrap: live state advanced from \(revisionBeforeFetch) to \(store.liveStateRevision) while fetching",
                 )
+                return false
+            }
+
+            guard Self.responseCarriesPlayback(playbackState: playbackState, queueResponse: queueResponse) else {
+                log("Web API reports no playback anywhere — keeping the existing queue")
                 return false
             }
 

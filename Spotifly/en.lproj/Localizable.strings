@@ -107,6 +107,7 @@
 
 /* Queue */
 "queue.title" = "Queue";
+"queue.open" = "Open queue";
 "queue.playing_from" = "Playing from";
 "queue.on_device" = "on";
 "queue.song_count %lld %lld" = "%lld songs (%lld upcoming)";

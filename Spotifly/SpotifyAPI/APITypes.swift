@@ -733,6 +733,14 @@ enum SpotifyAPIError: Error, LocalizedError {
     case invalidResponse
     case invalidURI
     case networkError(Error)
+    /// A transport command found no device to send itself to.
+    ///
+    /// Distinct from `notFound` and worth its own case: every `/me/player/*` command targets
+    /// whichever device the cluster says is active, and Spotify answers 404 when there is
+    /// none. That is a routing fact the caller can act on — the local player can take over —
+    /// not a failure to report, so it must not be flattened into `apiError` with everything
+    /// else. See `sendTransportCommand`.
+    case noActiveDevice
     case notFound
     case unauthorized
 
@@ -748,6 +756,8 @@ enum SpotifyAPIError: Error, LocalizedError {
             "Invalid Spotify URI format"
         case let .networkError(error):
             "Network error: \(error.localizedDescription)"
+        case .noActiveDevice:
+            "No active device to control"
         case .notFound:
             "Track not found"
         case .unauthorized:

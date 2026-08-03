@@ -39,6 +39,26 @@ static MIXER: Lazy<Mutex<Option<Arc<SoftMixer>>>> = Lazy::new(|| Mutex::new(None
 static SPIRC: Lazy<Mutex<Option<Arc<Spirc>>>> = Lazy::new(|| Mutex::new(None));
 static IS_PLAYING: AtomicBool = AtomicBool::new(false);
 static PLAYING_EVENT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Set while a `spotifly_resume` is working, so only one runs at a time.
+///
+/// Resuming is not instantaneous: `Spirc::play` only queues a command, and the fallback
+/// below it waits half a second for a `Playing` event before loading the saved context and
+/// waiting two more. Swift dispatches each press to its own detached task, so without this
+/// a user pressing play repeatedly — which is exactly what an unresponsive play button
+/// provokes — stacks several play-then-load sequences, each capturing `POSITION_MS` at its
+/// own moment and restarting the track there. `IS_PLAYING` does not cover the gap: it stays
+/// false until the first sequence actually produces audio.
+static RESUMING: AtomicBool = AtomicBool::new(false);
+
+/// Clears [`RESUMING`] however `spotifly_resume` returns — it has six exits.
+struct ResumeGuard;
+
+impl Drop for ResumeGuard {
+    fn drop(&mut self) {
+        RESUMING.store(false, Ordering::SeqCst);
+    }
+}
 static PLAYER_EVENT_TX: Lazy<Mutex<Option<mpsc::UnboundedSender<()>>>> =
     Lazy::new(|| Mutex::new(None));
 static QUEUE_CALLBACK: Lazy<Mutex<Option<extern "C" fn(*const c_char)>>> =
@@ -214,6 +234,20 @@ fn should_recover_after_cluster_end(
     listener_generation == current_generation && !teardown_in_progress
 }
 
+/// Which position a resume should seek to.
+///
+/// A point saved at deactivation outranks the live one, because the `Stopped` event that
+/// librespot sends on the way out has since reset the live position to zero. Zero means
+/// nothing was saved: either no deactivation is being recovered from, or playback was at
+/// the very start, and both want the live value.
+fn resume_position(saved_at_deactivation: u32, live: u32) -> u32 {
+    if saved_at_deactivation > 0 {
+        saved_at_deactivation
+    } else {
+        live
+    }
+}
+
 /// Whether this device is currently the active Spotify Connect device.
 fn is_active_device() -> bool {
     with_connection(|c| c.is_active_device)
@@ -264,11 +298,38 @@ fn current_device_id() -> Option<String> {
 // Position tracking - updated from player events
 static POSITION_MS: AtomicU32 = AtomicU32::new(0);
 
+/// Where playback should pick up after a deactivation, or 0 when there is nothing to
+/// recover.
+///
+/// `POSITION_MS` cannot serve this on its own. librespot stops the Player when the device
+/// is deactivated, and the `Stopped` event that follows must reset the live position —
+/// `handle_stop` fires for a queue that has run out and for `prev` at the first track too,
+/// where resuming mid-track would be wrong. Those cases are indistinguishable in the event,
+/// which carries only a play-request id and a track id.
+///
+/// So the resume point is captured where the cause *is* known: the `SessionDisconnected`
+/// arm, which librespot emits from `handle_disconnect` before the `handle_stop` that
+/// follows it.
+///
+/// One rule governs its lifetime: it survives until something newer describes where
+/// playback is. That is a `Loading` event, which establishes the position for the track it
+/// names, or a `Playing` event; a full cleanup drops it with the rest of the session.
+///
+/// The resume path only reads it, never takes it. `Spirc::load` merely queues a command, so
+/// a resume that has been *attempted* is not one that has *landed*: clearing on the attempt
+/// would leave a retry after a failed or silent load with nothing but the zero that
+/// `Stopped` wrote. Clearing on `Loading` instead is safe precisely because that event
+/// carries the seek target the resume passed in, so the live position already holds it.
+static RESUME_POSITION_MS: AtomicU32 = AtomicU32::new(0);
+
 // Current track duration (ms) - updated from TrackChanged event
 static CURRENT_DURATION_MS: AtomicU32 = AtomicU32::new(0);
 
 // Current logical track URI - for UI identity and detecting same-track reconnects.
 // The playable AudioItem may carry a different URI after Spotify relinking.
+//
+// Session-scoped: `spotifly_cleanup` drops it, because `resume_via_load` would otherwise
+// hand it to a load made by whichever account logged in next.
 static CURRENT_TRACK_URI: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 
 /// Stores the requested/context track identity exposed by librespot player events.
@@ -282,6 +343,10 @@ fn set_current_track_uri(track_uri: String) {
 
 // Current context URI - captured from SetQueue and cluster player state updates.
 // We keep the latest non-empty value to recover resume after reconnect.
+//
+// Session-scoped for the same reason as CURRENT_TRACK_URI above, and more sharply: this is
+// what a resume actually loads. "Latest non-empty" means a login cannot clear it by arriving,
+// so the cleanup has to.
 static CURRENT_CONTEXT_URI: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 
 // Connection state tracking - for transparency dashboard. See ConnectionState above;
@@ -1455,6 +1520,9 @@ async fn build_player_async(
                             IS_PLAYING.store(true, Ordering::SeqCst);
                             set_active_device(true);
                             PLAYING_EVENT_SEQ.fetch_add(1, Ordering::SeqCst);
+                            // Playback is running again, so any saved resume point belongs
+                            // to a deactivation that has been recovered from.
+                            RESUME_POSITION_MS.store(0, Ordering::SeqCst);
                             update_position(position_ms);
                             // Send playback state update to Swift
                             send_local_playback_state(true, position_ms);
@@ -1493,6 +1561,15 @@ async fn build_player_async(
                             // This used to clear it, which fought the cluster-derived value
                             // and made the UI think a remote speaker had taken over
                             // whenever local playback simply ended.
+                            //
+                            // The position *is* reset here, because this event cannot say
+                            // why playback stopped: `handle_stop` runs for a deactivation,
+                            // for a queue that has run out, and for `prev` at the first
+                            // track. Keeping the position for all of them made `next` on the
+                            // last track leave a resume point mid-track, so pressing play
+                            // afterwards restarted it there instead of from the beginning.
+                            // A deactivation saves what it needs in RESUME_POSITION_MS
+                            // before this arrives.
                             IS_PLAYING.store(false, Ordering::SeqCst);
                             update_position(0);
                         }
@@ -1554,7 +1631,23 @@ async fn build_player_async(
                             let track_uri_str = track_id.to_string();
                             debug!("Loading event: {} at {}ms", track_uri_str, position_ms);
 
+                            // Both, together. The position and the track URI are read as a
+                            // pair — `resume_via_load` seeks `POSITION_MS` within
+                            // `CURRENT_TRACK_URI` — so leaving the position behind here
+                            // meant that for the length of a load they described different
+                            // tracks. A natural transition hides it, because `EndOfTrack`
+                            // zeroes the position first; a manual `next` does not, and a
+                            // deactivation landing in that window saved the outgoing track's
+                            // offset against the incoming track's URI.
                             set_current_track_uri(track_uri_str.clone());
+                            update_position(position_ms);
+                            // A load supersedes anything saved for an earlier one. Safe
+                            // against the resume path it serves, which reads the saved point
+                            // before issuing the load that produces this event — and passes
+                            // it in as the seek target, so `position_ms` above is that same
+                            // value. The baton is handed from the saved point to the live
+                            // one, and a retry after a load that never plays still finds it.
+                            RESUME_POSITION_MS.store(0, Ordering::SeqCst);
 
                             if let Some(callback) = registered_callback(&LOADING_CALLBACK) {
                                 send_json(callback, &LoadingNotification {
@@ -1605,6 +1698,21 @@ async fn build_player_async(
                             // Capture before clearing: the recovery decision below needs to
                             // know what was playing, and set_active_device wipes half of it.
                             let intent = RecoveryIntent::capture();
+                            // Same reason, for the position. librespot calls handle_stop
+                            // right after emitting this, and the Stopped event that produces
+                            // resets the live position — so this is the last moment at which
+                            // where playback stopped is still known to be recoverable.
+                            //
+                            // Only when there is something to save. Zero is how this reads
+                            // as "nothing saved", so writing one would not merely be
+                            // useless: a second disconnect while already inactive — sleeping
+                            // after a handoff sends one, since `spotifly_disconnect` shuts
+                            // Spirc down — would overwrite a good point with the zero the
+                            // first disconnect's `Stopped` had just written.
+                            let stopped_at_ms = POSITION_MS.load(Ordering::SeqCst);
+                            if stopped_at_ms > 0 {
+                                RESUME_POSITION_MS.store(stopped_at_ms, Ordering::SeqCst);
+                            }
                             set_active_device(false);
 
                             // Only recover if the transport is genuinely broken. A dead
@@ -2319,8 +2427,28 @@ async fn wait_for_playing_event_async(previous_seq: u64, timeout: Duration) -> b
     PLAYING_EVENT_SEQ.load(Ordering::SeqCst) > previous_seq
 }
 
+/// Reloads what was playing, at the position it stopped.
+///
+/// **The caller must have activated the device.** `Spirc::load` only hands the command to a
+/// channel, so `Ok` means "queued", not "accepted" — and `SpircTask` drops `Load` while its
+/// connect state is inactive. This used to call `set_active_device(true)` on that `Ok`,
+/// which turned a discarded load into an apparent takeover: Swift then believed Spotifly was
+/// the active device and routed every later transport command to a local player that was
+/// ignoring all of them. Activity is recorded where it is actually established — by
+/// `ensure_active_for_playback` and by `init_player_async` — never inferred from a queued
+/// command. Both callers satisfy the precondition: `spotifly_resume` activates first, and
+/// the rehydration in `init_player_async` runs only when `should_resume()` held, which
+/// implies `was_active` and therefore that `spirc.activate()` already ran.
 fn resume_via_load(spirc: &Arc<Spirc>) -> i32 {
-    let position_ms = POSITION_MS.load(Ordering::SeqCst);
+    // Read rather than taken. `Spirc::load` only queues a command, so reaching this point
+    // does not mean playback resumed — the load can fail on a closed channel, or be accepted
+    // and never produce audio. Clearing here would throw away the only pre-deactivation
+    // position and leave the retry restarting the track from zero. The `Playing` event
+    // clears it instead, which is the one signal that the resume actually landed.
+    let position_ms = resume_position(
+        RESUME_POSITION_MS.load(Ordering::SeqCst),
+        POSITION_MS.load(Ordering::SeqCst),
+    );
     let context_uri = CURRENT_CONTEXT_URI.lock().unwrap().clone();
     let current_track_uri = CURRENT_TRACK_URI.lock().unwrap().clone();
 
@@ -2342,10 +2470,7 @@ fn resume_via_load(spirc: &Arc<Spirc>) -> i32 {
         );
 
         match spirc.load(load_request) {
-            Ok(_) => {
-                set_active_device(true);
-                return 0;
-            }
+            Ok(_) => return 0,
             Err(e) => {
                 debug!("Resume fallback context load failed: {:?}", e);
                 if is_channel_closed_error(&e) {
@@ -2370,10 +2495,7 @@ fn resume_via_load(spirc: &Arc<Spirc>) -> i32 {
         );
 
         match spirc.load(load_request) {
-            Ok(_) => {
-                set_active_device(true);
-                return 0;
-            }
+            Ok(_) => return 0,
             Err(e) => {
                 debug!("Resume fallback track load failed: {:?}", e);
                 if is_channel_closed_error(&e) {
@@ -2399,6 +2521,14 @@ pub extern "C" fn spotifly_resume() -> i32 {
         return 0;
     }
 
+    // A resume is already working; joining it is what this caller wanted, so report success
+    // rather than starting a second one that would restart the track underneath the first.
+    if RESUMING.swap(true, Ordering::SeqCst) {
+        debug!("Resume already in progress");
+        return 0;
+    }
+    let _resuming = ResumeGuard;
+
     let spirc = {
         let spirc_guard = SPIRC.lock().unwrap();
         spirc_guard.as_ref().cloned()
@@ -2406,6 +2536,17 @@ pub extern "C" fn spotifly_resume() -> i32 {
 
     match spirc {
         Some(spirc) => {
+            // Activation is a precondition, not an optimization. `SpircTask` matches
+            // `_ if !self.connect_state.is_active()` ahead of every transport command, so
+            // `Play`, `Load`, `Next`, `Prev`, `Shuffle` and `SetPosition` are discarded with
+            // a warning while inactive — the whole resume path below, load fallback
+            // included, would be dropped and nothing would play. Waking from sleep lands
+            // here every time: the sleep teardown shuts Spirc down, librespot answers with
+            // `SessionDisconnected`, and its handler clears the active flag.
+            if let Err(e) = ensure_active_for_playback(&spirc) {
+                return e;
+            }
+
             let play_seq_before = PLAYING_EVENT_SEQ.load(Ordering::SeqCst);
             match spirc.play() {
                 Ok(_) => {
@@ -2577,6 +2718,26 @@ pub extern "C" fn spotifly_cleanup() {
     REPEAT_TRACK_STATE.store(false, Ordering::SeqCst);
     REPEAT_CONTEXT_STATE.store(false, Ordering::SeqCst);
     POSITION_MS.store(0, Ordering::SeqCst);
+    // Belongs to the session being torn down. Surviving a logout would let a resume seek to
+    // an offset from the previous lifecycle, or another account's playback.
+    RESUME_POSITION_MS.store(0, Ordering::SeqCst);
+    // What that offset is an offset *into*, and the same argument applies with more at stake.
+    // `resume_via_load` loads `CURRENT_CONTEXT_URI` with `CURRENT_TRACK_URI` as its track
+    // hint, and nothing after a login rewrites them until playback establishes something new:
+    // `update_current_context_uri` ignores empty values, and `set_current_track_uri` only runs
+    // from player events. So pressing play as a freshly logged-in account reaches an activated
+    // Spirc with no queue, `play()` produces no `Playing` event, and the fallback loads the
+    // previous account's context — with its position, if this line's neighbour above had not
+    // already been cleared. Reachable through the ordinary control path: with nobody active,
+    // `sendTransportCommand` takes the Web API 404 and falls back to `spotifly_resume`.
+    //
+    // Only a full cleanup clears them. The wake and reconnect paths run
+    // `do_reconnect_cleanup`, which deliberately leaves playback state alone so the
+    // rehydrating load has something to reload; this function runs on logout and on an
+    // explicit rebuild, after which Rust has no track or context loaded — which is what Swift
+    // already assumes when `performInitialization` nils its own `currentTrackUri`.
+    *CURRENT_TRACK_URI.lock().unwrap() = None;
+    *CURRENT_CONTEXT_URI.lock().unwrap() = None;
     LAST_VOLUME.store(0, Ordering::SeqCst);
     LAST_ACTIVE_DEVICE_ID.lock().unwrap().clear();
 
@@ -3107,6 +3268,47 @@ mod tests {
             was_active: false
         }
         .should_resume());
+    }
+
+    // The Stopped event cannot say why playback stopped, so a deactivation saves its own
+    // resume point rather than relying on the live position surviving.
+
+    #[test]
+    fn a_deactivation_resume_point_outranks_the_live_position() {
+        // The live value is what Stopped reset it to on the way out.
+        assert_eq!(resume_position(93606, 0), 93606);
+    }
+
+    #[test]
+    fn an_ordinary_resume_uses_the_live_position() {
+        // Nothing saved: a pause and play that never went through a deactivation.
+        assert_eq!(resume_position(0, 12087), 12087);
+    }
+
+    #[test]
+    fn a_queue_that_ran_out_resumes_from_the_start() {
+        // `next` on the last track stops playback without deactivating, so nothing is
+        // saved and Stopped has zeroed the live position. Pressing play must not restart
+        // the track partway through.
+        assert_eq!(resume_position(0, 0), 0);
+    }
+
+    #[test]
+    fn nothing_is_resumed_without_also_being_activated() {
+        // `resume_via_load` requires an already-activated device: Spirc discards `Load`
+        // while inactive, and the function no longer claims activity for itself. Its
+        // reconnect caller gets that from `activate_after_connect`, which is a separate
+        // argument to `init_player_async` — so pin the implication that keeps the two
+        // consistent rather than leaving it to whoever next edits the call.
+        for was_playing in [false, true] {
+            for was_active in [false, true] {
+                let intent = RecoveryIntent {
+                    was_playing,
+                    was_active,
+                };
+                assert!(!intent.should_resume() || intent.was_active);
+            }
+        }
     }
 
     #[test]

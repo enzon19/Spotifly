@@ -335,17 +335,35 @@ struct NowPlayingBarView: View {
         }
     }
 
+    /// Where the playing track sits in the queue, as `n/total`.
+    ///
+    /// Shown only while there is a track to be the `n`. `currentIndex` is
+    /// `previousTracks.count`, which lands one past the end whenever the queue holds history
+    /// but nothing current — a state a queue reaches simply by playing out — and the label
+    /// then read `9/8`. The index is not wrong; the sentence is, because "track n of m" needs
+    /// an n. The slot keeps its width either way so the controls beside it do not shift.
     private var queuePosition: some View {
         Button {
             exitMiniPlayerIfNeeded()
             navigationCoordinator.navigateToQueue()
         } label: {
-            Text("\(store.currentIndex + 1)/\(store.queueLength)")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(width: 50, alignment: .trailing)
+            Group {
+                if store.queue.currentTrack != nil {
+                    Text("\(store.currentIndex + 1)/\(store.queueLength)")
+                } else {
+                    // The counter is the button's only label, so dropping it outright would
+                    // leave an invisible control that VoiceOver announces unnamed. The glyph
+                    // keeps the way into the queue both visible and reachable.
+                    Image(systemName: "text.line.first.and.arrowtriangle.forward")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .frame(width: 50, alignment: .trailing)
         }
         .buttonStyle(.plain)
+        .help("queue.open")
+        .accessibilityLabel("queue.open")
     }
 
     /// Whether the current track is favorited (from global store)

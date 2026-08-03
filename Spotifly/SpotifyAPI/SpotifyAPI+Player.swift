@@ -123,6 +123,8 @@ extension SpotifyAPI {
             return // Success
         case 401:
             throw SpotifyAPIError.unauthorized
+        case 404:
+            throw SpotifyAPIError.noActiveDevice
         default:
             try throwAPIError(data: data, statusCode: httpResponse.statusCode)
         }
@@ -156,6 +158,8 @@ extension SpotifyAPI {
             return // Success
         case 401:
             throw SpotifyAPIError.unauthorized
+        case 404:
+            throw SpotifyAPIError.noActiveDevice
         default:
             try throwAPIError(data: data, statusCode: httpResponse.statusCode)
         }
@@ -189,6 +193,8 @@ extension SpotifyAPI {
             return // Success
         case 401:
             throw SpotifyAPIError.unauthorized
+        case 404:
+            throw SpotifyAPIError.noActiveDevice
         default:
             try throwAPIError(data: data, statusCode: httpResponse.statusCode)
         }
@@ -222,6 +228,8 @@ extension SpotifyAPI {
             return // Success
         case 401:
             throw SpotifyAPIError.unauthorized
+        case 404:
+            throw SpotifyAPIError.noActiveDevice
         default:
             try throwAPIError(data: data, statusCode: httpResponse.statusCode)
         }
@@ -258,6 +266,8 @@ extension SpotifyAPI {
             return // Success
         case 401:
             throw SpotifyAPIError.unauthorized
+        case 404:
+            throw SpotifyAPIError.noActiveDevice
         default:
             try throwAPIError(data: data, statusCode: httpResponse.statusCode)
         }
@@ -295,6 +305,8 @@ extension SpotifyAPI {
             return // Success
         case 401:
             throw SpotifyAPIError.unauthorized
+        case 404:
+            throw SpotifyAPIError.noActiveDevice
         default:
             try throwAPIError(data: data, statusCode: httpResponse.statusCode)
         }
@@ -330,6 +342,8 @@ extension SpotifyAPI {
             return // Success
         case 401:
             throw SpotifyAPIError.unauthorized
+        case 404:
+            throw SpotifyAPIError.noActiveDevice
         default:
             try throwAPIError(data: data, statusCode: httpResponse.statusCode)
         }

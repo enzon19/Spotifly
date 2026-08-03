@@ -10,37 +10,6 @@ import MediaPlayer
 import QuartzCore
 import SwiftUI
 
-// MARK: - Drift Correction Timer
-
-/// Helper class for periodic drift correction (not UI updates)
-/// Uses a plain Thread with isCancelled check to avoid Swift concurrency issues
-private final class DriftCorrectionTimer {
-    private var thread: Thread?
-    static let checkNotification = Notification.Name("DriftCorrectionCheck")
-
-    func start() {
-        let notificationName = DriftCorrectionTimer.checkNotification
-        let thread = Thread {
-            while !Thread.current.isCancelled {
-                Task { @MainActor in
-                    NotificationCenter.default.post(name: notificationName, object: nil)
-                }
-                // Check drift every second (not 100ms - UI uses TimelineView now)
-                Thread.sleep(forTimeInterval: 1.0)
-            }
-        }
-        thread.name = "com.spotifly.drift-correction"
-        thread.qualityOfService = .utility
-        thread.start()
-        self.thread = thread
-    }
-
-    func stop() {
-        thread?.cancel()
-        thread = nil
-    }
-}
-
 // MARK: - Playback View Model
 
 @MainActor
@@ -71,9 +40,11 @@ final class PlaybackViewModel {
         currentTrackUri
     }
 
-    // Playback state from Mercury (duration/position for progress bar)
+    /// Length of the current track, as the stream reports it. Zero until one is known, which
+    /// is what stops a previous track's length being applied to a new one — see
+    /// `clampedToTrack`. The position that goes with it is derived from the anchor rather
+    /// than stored alongside; see `currentPositionMs`.
     var trackDurationMs: UInt32 = 0
-    var currentPositionMs: UInt32 = 0
 
     /// Volume (0.0 - 1.0)
     var volume: Double = 0.5 {
@@ -325,9 +296,7 @@ final class PlaybackViewModel {
         currentTrackUri = nil
         lastHandledTrackUri = nil
         updateNowPlayingInfo()
-        currentPositionMs = 0
-        positionAnchorMs = 0
-        positionAnchorTime = CACurrentMediaTime()
+        anchorPosition(0)
         isLoading = false
     }
 
@@ -495,10 +464,26 @@ final class PlaybackViewModel {
     /// a command that never happened — hence the `Bool` rather than a plain dispatch.
     /// The remote branch reports failures through `errorMessage`; the local branch leaves
     /// the resulting playback state to the Mercury callback.
+    ///
+    /// `isActiveDevice` is two-valued and the cluster is not: Spotifly is active, another
+    /// device is, or **nobody** is. The third state is reached routinely — waking from sleep
+    /// gets there, because the sleep teardown shuts Spirc down and librespot's
+    /// `SessionDisconnected` handler clears the active flag — and the Web API cannot act on
+    /// it, so it answers 404 and the command silently does nothing. The local player can,
+    /// which is why that 404 falls back rather than being reported.
+    ///
+    /// What the fallback recovers is **resume**, which is also the only one that needs
+    /// recovering. `spotifly_resume` activates and reloads the saved context, so playback
+    /// comes back where it stopped. The others reach an inactive Spirc, which drops them —
+    /// and that is the right outcome rather than a gap to close: with nobody active there is
+    /// no context loaded and no track playing, so there is nothing to pause, skip or seek.
+    /// Activating for them would take the Connect role away from the user's other clients in
+    /// order to accomplish nothing, and making them work would mean silently starting
+    /// playback in response to "next" or "seek" — a different feature, not this fix.
     @discardableResult
     private func sendTransportCommand(
         _ name: String,
-        local: () -> Void,
+        local: @escaping () -> Void,
         remote: @escaping (String) async throws -> Void,
     ) -> Bool {
         guard SpotifyPlayer.isActiveDevice else {
@@ -506,6 +491,17 @@ final class PlaybackViewModel {
                 guard let token = await tokenProvider?() else { return }
                 do {
                     try await remote(token)
+                } catch SpotifyAPIError.noActiveDevice {
+                    // Nothing out there to command, so command ourselves. Rust takes the
+                    // Connect role on the way through — `spotifly_resume` reloads the saved
+                    // context and activates — which is what pressing a transport control
+                    // with no device active asks for.
+                    guard SpotifyPlayer.isSessionConnected else {
+                        debugLog("PlaybackViewModel", "\(name) dropped - no active device and session not connected")
+                        return
+                    }
+                    debugLog("PlaybackViewModel", "\(name) had no active device - running locally")
+                    local()
                 } catch {
                     errorMessage = error.localizedDescription
                 }
@@ -532,9 +528,7 @@ final class PlaybackViewModel {
         }
 
         // Immediately reset position to 0 for responsive UI
-        positionAnchorMs = 0
-        positionAnchorTime = CACurrentMediaTime()
-        currentPositionMs = 0
+        anchorPosition(0)
         updateNowPlayingInfo()
     }
 
@@ -548,17 +542,13 @@ final class PlaybackViewModel {
         }
 
         // Immediately reset position to 0 for responsive UI
-        positionAnchorMs = 0
-        positionAnchorTime = CACurrentMediaTime()
-        currentPositionMs = 0
+        anchorPosition(0)
         updateNowPlayingInfo()
     }
 
     func seek(to positionMs: UInt32) {
         // Update anchor immediately for smooth UI feedback during scrubbing
-        positionAnchorMs = positionMs
-        positionAnchorTime = CACurrentMediaTime()
-        currentPositionMs = positionMs
+        anchorPosition(positionMs)
         updateNowPlayingPosition()
 
         // Debounce the actual seek operation to avoid flooding Spirc/API with requests
@@ -583,9 +573,10 @@ final class PlaybackViewModel {
             return
         }
 
-        // Don't call syncPositionAnchor() - Rust returns 0 immediately after resume
-        // Keep the current positionAnchorMs (correct from paused state), just update the time
-        positionAnchorTime = CACurrentMediaTime()
+        // Don't call syncPositionAnchor() - Rust returns 0 immediately after resume.
+        // Re-anchor to the position we already hold, which is correct from the paused state:
+        // only the clock restarts.
+        anchorPosition(positionAnchorMs)
         updateNowPlayingPosition()
     }
 
@@ -891,8 +882,12 @@ final class PlaybackViewModel {
     ///
     /// The `rustPosition > 0` clause guards the gap between the two: Rust reports 0 both for
     /// "at the start" and for "nothing loaded". Snapping a running progress bar to zero
-    /// because a rebuild cleared the position would be worse than holding the last shown
-    /// value — so a zero is only adopted when we have no anchor of our own either.
+    /// because the position was cleared out from under it would be worse than holding the
+    /// last shown value — so a zero is only adopted when we have no anchor of our own either.
+    ///
+    /// A teardown no longer produces such a zero: `PlayerEvent::Stopped` keeps the position
+    /// now, because the resume path seeks to it. The clause still earns its place for the
+    /// zeroes that remain — `EndOfTrack`, and the reset on logout.
     private func freezePositionForDisconnect() {
         let displayedPosition = interpolatedPositionMs
         let rustPosition = SpotifyPlayer.positionMs
@@ -904,11 +899,7 @@ final class PlaybackViewModel {
             displayedPosition
         }
 
-        positionAnchorMs = frozenPosition
-        positionAnchorTime = CACurrentMediaTime()
-        currentPositionMs = trackDurationMs > 0
-            ? min(frozenPosition, trackDurationMs)
-            : frozenPosition
+        anchorPosition(frozenPosition)
         debugLog("PlaybackViewModel", "Connection not ready, position frozen at \(frozenPosition)ms")
     }
 
@@ -962,10 +953,7 @@ final class PlaybackViewModel {
                 }
 
                 // Use position from loading callback - this is reliable
-                let posMs = notification.positionMs
-                positionAnchorMs = posMs
-                positionAnchorTime = CACurrentMediaTime()
-                currentPositionMs = posMs
+                anchorPosition(notification.positionMs)
 
                 if trackChanged {
                     updateNowPlayingInfo()
@@ -1045,28 +1033,13 @@ final class PlaybackViewModel {
 
         isShuffleEnabled = state.shuffle
 
-        // Sync position anchor on state changes
-        // When monitoring a remote device, position_ms is the position at timestamp_ms
-        // We need to account for elapsed time since that timestamp to get current position
+        // Sync position anchor on state changes. When monitoring a remote device,
+        // position_ms is the position at timestamp_ms, which can be minutes old.
         if state.positionMs >= 0 {
             let posMs = UInt32(state.positionMs)
-            let now = CACurrentMediaTime()
-
-            // If we have a valid timestamp, adjust anchor time backwards by elapsed time
-            // This makes interpolation give the correct current position
-            if state.timestampMs > 0 {
-                let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-                let elapsedSinceTimestamp = max(0, nowMs - state.timestampMs)
-                let elapsedSeconds = Double(elapsedSinceTimestamp) / 1000.0
-                debugLog("PlaybackViewModel", "Position anchor: \(positionAnchorMs) -> \(posMs) (timestamp was \(elapsedSinceTimestamp)ms ago)")
-                positionAnchorMs = posMs
-                positionAnchorTime = now - elapsedSeconds
-            } else {
-                debugLog("PlaybackViewModel", "Position anchor: \(positionAnchorMs) -> \(posMs)")
-                positionAnchorMs = posMs
-                positionAnchorTime = now
-            }
-            currentPositionMs = posMs
+            let anchor = positionAnchor(forPosition: state.positionMs, takenAt: state.timestampMs)
+            debugLog("PlaybackViewModel", "Position anchor: \(positionAnchorMs) -> \(posMs)\(anchor.logSuffix)")
+            anchorPosition(posMs, at: anchor.time)
         }
 
         // Update Now Playing position if playback rate changed, or if track changed
@@ -1108,30 +1081,11 @@ final class PlaybackViewModel {
         }
 
         // Set position anchor accounting for elapsed time since the API timestamp.
-        // The API timestamp is when Spotify last received a state change — it can be
-        // arbitrarily stale during uninterrupted playback. If compensation would push
-        // the position past the track end, discard it and anchor at progress_ms directly.
         if progressMs >= 0 {
             let posMs = UInt32(progressMs)
-            let now = CACurrentMediaTime()
-
-            if timestampMs > 0 {
-                let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-                let elapsedMs = max(0, nowMs - timestampMs)
-                let compensated = Int64(progressMs) + elapsedMs
-                let stale = durationMs > 0 && compensated > Int64(durationMs)
-                if stale {
-                    debugLog("PlaybackViewModel", "Web API position anchor: \(posMs)ms (timestamp was \(elapsedMs)ms ago, stale — ignoring compensation)")
-                } else {
-                    debugLog("PlaybackViewModel", "Web API position anchor: \(posMs)ms (timestamp was \(elapsedMs)ms ago)")
-                }
-                positionAnchorMs = posMs
-                positionAnchorTime = stale ? now : now - Double(elapsedMs) / 1000.0
-            } else {
-                positionAnchorMs = posMs
-                positionAnchorTime = now
-            }
-            currentPositionMs = posMs
+            let anchor = positionAnchor(forPosition: Int64(progressMs), takenAt: timestampMs)
+            debugLog("PlaybackViewModel", "Web API position anchor: \(posMs)ms\(anchor.logSuffix)")
+            anchorPosition(posMs, at: anchor.time)
         }
 
         // Update Now Playing info
@@ -1144,8 +1098,33 @@ final class PlaybackViewModel {
     // UI reads interpolatedPositionMs (computed), not currentPositionMs directly
     private var positionAnchorMs: UInt32 = 0
     private var positionAnchorTime: Double = CACurrentMediaTime()
-    private var driftCorrectionTimer: DriftCorrectionTimer?
-    private var driftObserver: NSObjectProtocol?
+    private var driftCorrectionTask: Task<Void, Never>?
+
+    /// Re-anchors the displayed position: `positionMs` is where playback is, `time` is the
+    /// moment it was there.
+    ///
+    /// The pair is one fact, and writing it in one place is the point: eleven call sites
+    /// used to assign it field by field, and had already drifted apart over whether the
+    /// position was capped at the track length.
+    ///
+    /// `time` defaults to now. A caller holding a snapshot that was true *earlier* — a
+    /// Mercury or Web API state carrying a timestamp — passes that moment instead, so
+    /// interpolation accounts for the delay rather than restarting the clock.
+    private func anchorPosition(_ positionMs: UInt32, at time: Double = CACurrentMediaTime()) {
+        positionAnchorMs = positionMs
+        positionAnchorTime = time
+    }
+
+    /// The position to report while playback is not advancing.
+    ///
+    /// Derived rather than stored. This used to be a third field assigned beside the anchor
+    /// on every update, always to exactly this expression — a cache of a one-line derivation,
+    /// whose only possible disagreement with its source was being stale. Reading it live also
+    /// means a duration arriving after the position now caps it, where the stored copy kept
+    /// whatever it was written with.
+    var currentPositionMs: UInt32 {
+        clampedToTrack(positionAnchorMs)
+    }
 
     /// Computed position using anchor interpolation - UI should bind to this
     /// Called by TimelineView on every frame for smooth updates
@@ -1153,28 +1132,82 @@ final class PlaybackViewModel {
         guard isPlaying, isConnectionReady else { return currentPositionMs }
         let elapsed = CACurrentMediaTime() - positionAnchorTime
         let elapsedMs = UInt32(max(0, min(elapsed * 1000, Double(UInt32.max - 1))))
-        let interpolated = positionAnchorMs.addingReportingOverflow(elapsedMs).partialValue
-        // Don't clamp to 0 if duration is unknown yet
-        guard trackDurationMs > 0 else { return interpolated }
-        return min(interpolated, trackDurationMs)
+        return clampedToTrack(positionAnchorMs.addingReportingOverflow(elapsedMs).partialValue)
     }
 
-    private func startPositionTimer() {
-        let timer = DriftCorrectionTimer()
+    /// Where to start the anchor clock for a snapshot, and what to say about it in the log.
+    private struct PositionAnchor {
+        let time: Double
+        /// Trails the caller's own log line, which names the source. Empty when the snapshot
+        /// carried no timestamp and there was nothing to compensate for.
+        let logSuffix: String
+    }
 
-        // Observe drift correction notifications
-        driftObserver = NotificationCenter.default.addObserver(
-            forName: DriftCorrectionTimer.checkNotification,
-            object: nil,
-            queue: .main,
-        ) { [weak self] _ in
-            Task { @MainActor in
-                self?.checkDriftAndSync()
-            }
+    /// Works out the anchor time for a position that was true at `timestampMs`.
+    ///
+    /// A snapshot carries a position and the moment it was measured, so the anchor is
+    /// back-dated by the time since — otherwise interpolation reports a stale position as
+    /// the current one. That is the ordinary case, and it is what keeps the progress bar in
+    /// step with a remote device that Spotify last reported on some seconds ago.
+    ///
+    /// The compensation is **discarded** when it would carry the position past the end of
+    /// the track. A snapshot that stale cannot describe what is playing now, and back-dating
+    /// by it parks the bar at the track end, where it reads as broken rather than as behind.
+    /// Anchoring at the raw position instead shows something genuinely measured, merely out
+    /// of date, and the next update corrects it. Clamping the compensation to land exactly
+    /// on the track end was considered and rejected: `clampedToTrack` already bounds the
+    /// display, so it looks identical to no guard at all — it tidies the arithmetic without
+    /// changing what the user sees.
+    ///
+    /// The bound reads `trackDurationMs` rather than taking a duration, so it is by
+    /// construction the same length the display clamps against; both callers refresh it from
+    /// the same snapshot before anchoring. This guard used to live only on the Web API path,
+    /// but staleness is a property of Spotify's timestamp, not of the endpoint that carried
+    /// it — cluster updates forward `player_state.timestamp` unchanged and can be minutes
+    /// old, while local callbacks stamp the current time and compensate by nothing.
+    private func positionAnchor(forPosition positionMs: Int64, takenAt timestampMs: Int64) -> PositionAnchor {
+        let now = CACurrentMediaTime()
+        guard timestampMs > 0 else { return PositionAnchor(time: now, logSuffix: "") }
+
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let elapsedMs = max(0, nowMs - timestampMs)
+        let overshootsTrack = trackDurationMs > 0
+            && positionMs + elapsedMs > Int64(trackDurationMs)
+
+        guard !overshootsTrack else {
+            return PositionAnchor(
+                time: now,
+                logSuffix: " (timestamp was \(elapsedMs)ms ago, stale — ignoring compensation)",
+            )
         }
 
-        timer.start()
-        driftCorrectionTimer = timer
+        return PositionAnchor(
+            time: now - Double(elapsedMs) / 1000.0,
+            logSuffix: " (timestamp was \(elapsedMs)ms ago)",
+        )
+    }
+
+    /// Caps a position at the track length, leaving it untouched while no length is known.
+    ///
+    /// The unknown case is what makes a track change safe: the `currentTrackUri` `didSet`
+    /// clears the duration before the new track's position arrives, so the previous track's
+    /// length is never applied to it.
+    private func clampedToTrack(_ positionMs: UInt32) -> UInt32 {
+        trackDurationMs > 0 ? min(positionMs, trackDurationMs) : positionMs
+    }
+
+    /// Runs the drift check once a second for the lifetime of the view model.
+    ///
+    /// Once a second, not every frame: the UI interpolates its own position through
+    /// `TimelineView`, so this exists only to pull that clock back to Rust's reality.
+    private func startPositionTimer() {
+        driftCorrectionTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled, let self else { return }
+                checkDriftAndSync()
+            }
+        }
     }
 
     /// Sync position anchor with Rust - call after seek, play, resume, track change
@@ -1186,9 +1219,7 @@ final class PlaybackViewModel {
             return
         }
         debugLog("PlaybackViewModel", "syncPositionAnchor: rustPosition=\(rustPosition), was positionAnchorMs=\(positionAnchorMs)")
-        positionAnchorMs = rustPosition
-        positionAnchorTime = CACurrentMediaTime()
-        currentPositionMs = rustPosition
+        anchorPosition(rustPosition)
     }
 
     /// Called every second to check for drift and sync state
@@ -1228,11 +1259,7 @@ final class PlaybackViewModel {
             let rustPosition = SpotifyPlayer.positionMs
             let drift = abs(Int64(rustPosition) - Int64(interpolatedPositionMs))
             if drift > 500 {
-                positionAnchorMs = rustPosition
-                positionAnchorTime = CACurrentMediaTime()
-                currentPositionMs = trackDurationMs > 0
-                    ? min(rustPosition, trackDurationMs)
-                    : rustPosition
+                anchorPosition(rustPosition)
                 didCorrectDrift = true
             }
         }
