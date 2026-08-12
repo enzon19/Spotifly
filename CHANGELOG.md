@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.6] - 2026-08-12
+
 ### Changed
 - `currentPositionMs` is derived instead of stored. Once `anchorPosition` owned the write, the field was assigned on every update to exactly `min(positionAnchorMs, trackDurationMs)` — a cache of a one-line derivation, whose only possible disagreement with its source was being stale. It is now computed from the anchor, so the view model holds one position instead of two that had to be kept in step, and the clamp both it and `interpolatedPositionMs` apply lives in a single `clampedToTrack` helper. One behaviour improves as a side effect: a duration arriving *after* a position now caps it, where the stored copy kept whatever value it was written with
 - The once-a-second drift check is a `Task` instead of a thread and a notification. It ran on a manually managed `Thread` looping on `Thread.sleep`, which posted a `NotificationCenter` notification, observed on the main queue, which hopped to the main actor to call one method — about forty lines and a process-wide notification name to schedule a single timer. Its comment cited avoiding "Swift concurrency issues", which predates the project's settled `@MainActor` isolation; the view model is main-actor-isolated, so an awaiting `Task` sits on the right actor with no hop and no observer. Two loose ends went with it: the timer's `stop()` was never called and the observer was never removed, both harmless only because the view model is an immortal singleton, and the replacement is cancellable and holds `self` weakly
