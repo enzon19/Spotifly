@@ -14,12 +14,8 @@ struct FocusedNavigationSelection: FocusedValueKey {
     typealias Value = Binding<NavigationItem?>
 }
 
-struct FocusedSession: FocusedValueKey {
-    typealias Value = SpotifySession
-}
-
-struct FocusedRecentlyPlayedService: FocusedValueKey {
-    typealias Value = RecentlyPlayedService
+struct FocusedHomeService: FocusedValueKey {
+    typealias Value = HomeService
 }
 
 extension FocusedValues {
@@ -28,14 +24,9 @@ extension FocusedValues {
         set { self[FocusedNavigationSelection.self] = newValue }
     }
 
-    var session: SpotifySession? {
-        get { self[FocusedSession.self] }
-        set { self[FocusedSession.self] = newValue }
-    }
-
-    var recentlyPlayedService: RecentlyPlayedService? {
-        get { self[FocusedRecentlyPlayedService.self] }
-        set { self[FocusedRecentlyPlayedService.self] = newValue }
+    var homeService: HomeService? {
+        get { self[FocusedHomeService.self] }
+        set { self[FocusedHomeService.self] = newValue }
     }
 }
 
@@ -65,6 +56,10 @@ struct SpotiflyApp: App {
     init() {
         // Set activation policy to regular to support media keys
         NSApplication.shared.setActivationPolicy(.regular)
+
+        // Nothing reads the dashboard grant any more; this is where the last copy of it on an
+        // upgraded machine gets thrown away.
+        KeychainManager.purgeDashboardGrant()
     }
 
     var body: some Scene {
@@ -90,8 +85,7 @@ struct SpotiflyApp: App {
 
 struct SpotiflyCommands: Commands {
     @FocusedValue(\.navigationSelection) var navigationSelection
-    @FocusedValue(\.session) var session
-    @FocusedValue(\.recentlyPlayedService) var recentlyPlayedService
+    @FocusedValue(\.homeService) var homeService
 
     private var playbackViewModel: PlaybackViewModel {
         PlaybackViewModel.shared
@@ -125,10 +119,8 @@ struct SpotiflyCommands: Commands {
             Divider()
 
             Button("menu.like_track") {
-                guard let session else { return }
                 Task {
-                    let token = await session.validAccessToken()
-                    await playbackViewModel.toggleCurrentTrackFavorite(accessToken: token)
+                    await playbackViewModel.toggleCurrentTrackFavorite()
                 }
             }
             .keyboardShortcut("l", modifiers: .command)
@@ -164,10 +156,9 @@ struct SpotiflyCommands: Commands {
             .keyboardShortcut("f", modifiers: .command)
 
             Button("menu.refresh") {
-                guard let session, let service = recentlyPlayedService else { return }
+                guard let homeService else { return }
                 Task {
-                    let token = await session.validAccessToken()
-                    await service.refresh(accessToken: token)
+                    await homeService.refresh()
                 }
             }
             .keyboardShortcut("r", modifiers: .command)
@@ -180,8 +171,11 @@ struct SpotiflyCommands: Commands {
                 }
                 .keyboardShortcut("d", modifiers: [.command, .shift])
 
-                Button("Copy OAuth Token") {
-                    if let token = SpotifySession.current?.accessToken {
+                // The grant's own token, which is what every request now carries. Paste it
+                // into a curl and you are the app.
+                Button("Copy Access Token") {
+                    Task {
+                        guard let token = try? await KeymasterSession.shared.accessToken() else { return }
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(token, forType: .string)
                     }

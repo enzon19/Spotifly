@@ -11,7 +11,6 @@ struct ArtistDetailView: View {
     let artistId: String
 
     @Bindable var playbackViewModel: PlaybackViewModel
-    @Environment(SpotifySession.self) private var session
     @Environment(NavigationCoordinator.self) private var navigationCoordinator
     @Environment(AppStore.self) private var store
     @Environment(ArtistService.self) private var artistService
@@ -109,13 +108,6 @@ struct ArtistDetailView: View {
                             .font(.title)
                             .bold()
                             .multilineTextAlignment(.center)
-
-                        if !artist.genres.isEmpty {
-                            Text(artist.genres.prefix(3).joined(separator: ", "))
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                                .multilineTextAlignment(.center)
-                        }
                     }
                 }
                 .padding(.top, 24)
@@ -253,11 +245,7 @@ struct ArtistDetailView: View {
     private func unfollowArtist() {
         Task {
             do {
-                let token = await session.validAccessToken()
-                try await artistService.unfollowArtist(
-                    artistId: artistId,
-                    accessToken: token,
-                )
+                try await artistService.unfollowArtist(artistId: artistId)
                 // Navigate away from the unfollowed artist
                 navigationCoordinator.clearArtistSelection()
             } catch {

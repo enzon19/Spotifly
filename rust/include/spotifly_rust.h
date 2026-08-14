@@ -54,21 +54,19 @@ typedef enum __attribute__((enum_extensibility(open))) SpotiflyResult : int32_t 
 ///                     normal case: only the first init after a grant carries a token.
 SpotiflyResult spotifly_init_player(const char* _Nullable access_token);
 
-/// Runs the one-time streaming authorization: opens the browser, waits for the loopback
-/// callback, exchanges the code, connects, and persists the credentials.
+/// Completes the one-time streaming authorization with a token Swift has already minted:
+/// connects once and persists the credentials every later init connects from.
 ///
-/// Blocks on a human, so never call this on the main thread. There is no cancellation; the
-/// flow terminates on its own.
+/// Swift owns the OAuth flow itself (see KeymasterAuth), because the same token also
+/// authorizes pathfinder and spclient.
+///
+/// @param access_token A token minted with Spotify's desktop client id. Must not be NULL.
 ///
 /// Returns:
 ///    0 = Authorized, credentials cached
 ///   -1 = Failed
 ///   -2 = Superseded by a logout; any credentials written were removed again
-int32_t spotifly_authorize_streaming(void);
-
-/// Whether a streaming grant has already been completed on this machine.
-/// Returns 1 when credentials are cached, 0 otherwise.
-int32_t spotifly_has_streaming_credentials(void);
+int32_t spotifly_authorize_streaming(const char* _Nonnull access_token);
 
 /// The Spotify account id the last successful grant authenticated as, or NULL.
 /// The caller owns the string and must free it with spotifly_free_string().
@@ -244,6 +242,19 @@ typedef void (*ActiveDeviceCallback)(const char* device_id);
 /// Called on every cluster update — use this to track which device is active
 /// without polling the Web API.
 void spotifly_register_active_device_callback(ActiveDeviceCallback callback);
+
+/// Returns the last queue the Connect cluster described, as JSON, or NULL if no cluster
+/// update has arrived yet. Caller owns the string and must free it with spotifly_free_string.
+/// Replaces the Web API's /me/player and /me/player/queue for Swift's bootstrap.
+char* spotifly_get_queue_snapshot(void);
+
+/// Callback function type for Connect device-list updates.
+/// Receives the JSON array `/me/player/devices` used to return, so the same decoder serves both.
+typedef void (*DevicesCallback)(const char* devices_json);
+
+/// Registers a callback to receive the Connect device list from cluster updates.
+/// Fires only when the list actually changes, not on every cluster tick.
+void spotifly_register_devices_callback(DevicesCallback callback);
 
 /// Callback function type for connection state change notifications.
 /// Receives a JSON string containing full connection state.

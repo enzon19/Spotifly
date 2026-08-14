@@ -13,11 +13,6 @@ import Foundation
 final class PlaylistService {
     private let store: AppStore
 
-    /// Used by the loading entry points, which often decide there is nothing to
-    /// fetch. They take the token themselves, *after* deciding, so a cache hit
-    /// costs nothing.
-    private let tokenProvider: () async -> String
-
     /// One run per playlist ID — see `InFlightRequests`.
     private let playlistRequests = InFlightRequests<Void>()
 
@@ -25,9 +20,26 @@ final class PlaylistService {
     private let listRequests = InFlightRequests<Void>()
     private static let listKey = "user-playlists"
 
-    init(store: AppStore, tokenProvider: @escaping () async -> String) {
+    /// The account's own profile, which the library writes address the rootlist by.
+    private let profileRequests = InFlightRequests<Void>()
+    private static let profileKey = "user-profile"
+
+    /// The playlist reads and the item mutations. No token is passed in: both clients run on
+    /// the keymaster grant and hold it themselves.
+    private let partnerAPI: PartnerAPI
+
+    /// The playlist's own existence — creating it, renaming it, and the library's list of
+    /// them — which pathfinder has no operations for. See `PlaylistChanges.swift`.
+    private let spclientAPI: SpclientAPI
+
+    init(
+        store: AppStore,
+        partnerAPI: PartnerAPI = PartnerAPI(),
+        spclientAPI: SpclientAPI = SpclientAPI(),
+    ) {
         self.store = store
-        self.tokenProvider = tokenProvider
+        self.partnerAPI = partnerAPI
+        self.spclientAPI = spclientAPI
     }
 
     // MARK: - User Playlists
@@ -46,7 +58,6 @@ final class PlaylistService {
 
         try await listRequests.run(Self.listKey) {
             let offset = self.store.playlistsPagination.nextOffset ?? 0
-            let accessToken = await self.tokenProvider()
             self.store.playlistsPagination.isLoading = true
             defer {
                 // Only if this run is still the one loading: a superseded run
@@ -56,15 +67,15 @@ final class PlaylistService {
                 }
             }
 
-            let response = try await SpotifyAPI.fetchUserPlaylists(
-                accessToken: accessToken,
-                limit: 50,
-                offset: offset,
-            )
+            let page = try await self.partnerAPI.libraryPlaylists(offset: offset)
             // See AlbumService.loadUserAlbums: a superseded run must not write.
             try Task.checkCancellation()
 
-            let playlists = response.playlists.map { Playlist(from: $0) }
+            // Can be fewer than the page holds, so the offset advances by the page's item count
+            // rather than by this one. Folders are excluded by asking for the list flattened
+            // (see `PathfinderLibraryVariables`) rather than by being filtered here, which also
+            // brings back the playlists nested inside them.
+            let playlists = page.entities.compactMap { Playlist(pathfinder: $0) }
             self.store.upsertPlaylists(playlists)
 
             let playlistIds = playlists.map(\.id)
@@ -75,9 +86,10 @@ final class PlaylistService {
             }
 
             self.store.playlistsPagination.isLoaded = true
-            self.store.playlistsPagination.hasMore = response.hasMore
-            self.store.playlistsPagination.nextOffset = response.nextOffset
-            self.store.playlistsPagination.total = response.total
+            self.store.playlistsPagination.advance(
+                by: page.items?.count ?? 0,
+                total: page.totalCount ?? 0,
+            )
         }
     }
 
@@ -102,7 +114,7 @@ final class PlaylistService {
         guard store.playlists[playlistId]?.tracksLoaded != true else { return }
 
         try await playlistRequests.run(playlistId) {
-            try await self.loadPlaylist(playlistId: playlistId, accessToken: self.tokenProvider())
+            try await self.loadPlaylist(playlistId: playlistId)
         }
     }
 
@@ -118,89 +130,114 @@ final class PlaylistService {
     /// postcondition — a caller can join either one. So a playlist that is somehow
     /// not in the store still gets loaded whole here; this only *adds* the guarantee
     /// that the tracks are freshly fetched.
+    /// A forced reload means the store's copy is already known to be wrong — after an add,
+    /// whose rows carry locally generated uids, or after a move, whose order is optimistic. So
+    /// if the refetch does not land, the contents are marked stale: left marked loaded, nothing
+    /// would fetch them again for the rest of the session, and a `local:` uid is one the
+    /// service has never heard of, so the row it names can be neither removed nor moved.
+    ///
+    /// Not when this run was *superseded*, though. The run that replaced it owns the outcome
+    /// and marks the contents stale itself if it fails in turn — which is why this lives here
+    /// rather than in each caller's `catch`, where whichever run happened to be cancelled last
+    /// would decide.
     func reloadPlaylistTracks(playlistId: String) async throws {
         playlistRequests.cancel(playlistId)
 
-        try await playlistRequests.run(playlistId) {
-            try await self.loadPlaylist(playlistId: playlistId, accessToken: self.tokenProvider(), forceTracks: true)
+        do {
+            try await playlistRequests.run(playlistId) {
+                try await self.loadPlaylist(playlistId: playlistId, forceTracks: true)
+            }
+        } catch {
+            if !Self.isSupersession(error) {
+                store.invalidatePlaylistTracks(for: playlistId)
+            }
+            throw error
         }
     }
 
-    private func loadPlaylist(playlistId: String, accessToken: String, forceTracks: Bool = false) async throws {
-        // Re-read inside the run: a caller can arrive just as another run finishes.
-        guard let known = store.playlists[playlistId] else {
-            async let detailsTask = SpotifyAPI.fetchPlaylistDetails(
-                accessToken: accessToken,
-                playlistId: playlistId,
-            )
-            async let tracksTask = SpotifyAPI.fetchPlaylistTracks(
-                accessToken: accessToken,
-                playlistId: playlistId,
-            )
-            let (details, playlistTracks) = try await (detailsTask, tracksTask)
-            // A reload can supersede this run; it must not write over the fresher order.
-            try Task.checkCancellation()
+    /// Whether a failure means "something newer owns this" rather than "the request failed".
+    ///
+    /// Two forms, because the run can be cut at two points: `loadPlaylist` checks cancellation
+    /// itself, and `URLSession` reports a cancelled task as a `URLError` of its own rather than
+    /// as a `CancellationError`.
+    private static func isSupersession(_ error: any Error) -> Bool {
+        error is CancellationError || (error as? URLError)?.code == .cancelled
+    }
 
-            store.upsertPlaylist(Playlist(from: details))
-            storeTracks(playlistTracks, for: playlistId)
+    /// Loads a playlist and its contents in **one** request.
+    ///
+    /// `fetchPlaylist` answers with both, so the two-branch shape this replaces — details
+    /// cached, tracks not — has nothing left to skip.
+    private func loadPlaylist(playlistId: String, forceTracks: Bool = false) async throws {
+        if !forceTracks, let known = store.playlists[playlistId], known.tracksLoaded {
             return
         }
 
-        guard forceTracks || !known.tracksLoaded else { return }
-
-        let playlistTracks = try await SpotifyAPI.fetchPlaylistTracks(
-            accessToken: accessToken,
-            playlistId: playlistId,
-        )
+        let union = try await partnerAPI.playlist(id: playlistId)
+        // A reload can supersede this run; it must not write over the fresher order.
         try Task.checkCancellation()
-        storeTracks(playlistTracks, for: playlistId)
-    }
 
-    /// Stores a playlist's tracks and marks its track list as loaded.
-    private func storeTracks(_ playlistTracks: [APITrack], for playlistId: String) {
-        let tracks = playlistTracks.map { Track(from: $0) }
+        guard let (playlist, tracks) = union.entities() else {
+            throw PartnerAPIError.emptyPayload
+        }
+
+        store.upsertPlaylist(playlist)
         store.upsertTracks(tracks)
         store.setPlaylistTracks(
-            tracks.map(\.id),
-            totalDurationMs: tracks.reduce(0) { $0 + $1.durationMs },
+            playlist.items,
+            totalDurationMs: playlist.totalDurationMs,
             for: playlistId,
         )
     }
 
     // MARK: - Playlist Mutations
 
-    /// Create a new playlist
-    func createPlaylist(
-        name: String,
-        description: String? = nil,
-        accessToken: String,
-    ) async throws -> Playlist {
-        let response = try await SpotifyAPI.createPlaylist(
-            accessToken: accessToken,
+    /// Creates a playlist and lists it in the user's library.
+    ///
+    /// **Two writes where `POST /me/playlists` was one.** The playlist service makes the
+    /// playlist and answers its uri; nothing puts it in the library until the rootlist is told
+    /// to hold it. Measured 2026-08-14 — the web client sends both.
+    func createPlaylist(name: String, description: String? = nil) async throws -> Playlist {
+        let owner = try await requireProfile()
+
+        let id = try await spclientAPI.createPlaylist(name: name, description: description)
+        try await spclientAPI.addPlaylistToLibrary(username: owner.id, playlistId: id)
+
+        // Built here rather than fetched back: everything a new playlist has is already known,
+        // and it is empty by construction — so `tracksLoaded` is true in the strong sense, not
+        // as an assumption. See the "cache what was fetched" rule in AGENTS.md.
+        let playlist = Playlist(
+            id: id,
             name: name,
             description: description,
+            images: ImageSet(variants: []),
+            uri: "spotify:playlist:\(id)",
+            isPublic: false,
+            ownerId: owner.id,
+            ownerName: owner.displayName,
+            externalUrl: nil,
+            items: [],
+            totalDurationMs: 0,
+            knownTrackCount: 0,
+            tracksLoaded: true,
         )
 
-        let playlist = Playlist(from: response)
         store.addPlaylistToUserLibrary(playlist)
         return playlist
     }
 
-    /// Update playlist details (name, description)
+    /// Renames a playlist, changes its description, or both.
     func updatePlaylistDetails(
         playlistId: String,
         name: String? = nil,
         description: String? = nil,
-        accessToken: String,
     ) async throws {
-        try await SpotifyAPI.updatePlaylistDetails(
-            accessToken: accessToken,
-            playlistId: playlistId,
+        try await spclientAPI.changePlaylistAttributes(
+            id: playlistId,
             name: name,
             description: description,
         )
 
-        // Update store on success
         store.updatePlaylistDetails(
             id: playlistId,
             name: name,
@@ -208,26 +245,64 @@ final class PlaylistService {
         )
     }
 
-    /// Delete a playlist
-    func deletePlaylist(playlistId: String, accessToken: String) async throws {
-        try await SpotifyAPI.deletePlaylist(
-            accessToken: accessToken,
+    /// Deletes a playlist — which is to say, drops it from the user's library.
+    ///
+    /// The same call as `unfollowPlaylist` below, and the Web API said so too: `DELETE
+    /// /playlists/{id}/followers` served both. The two names are kept because the two menu
+    /// items mean different things to the person clicking them.
+    func deletePlaylist(playlistId: String) async throws {
+        try await removeFromLibrary(playlistId: playlistId)
+    }
+
+    /// Stops following someone else's playlist.
+    func unfollowPlaylist(playlistId: String) async throws {
+        try await removeFromLibrary(playlistId: playlistId)
+    }
+
+    private func removeFromLibrary(playlistId: String) async throws {
+        let owner = try await requireProfile()
+        try await spclientAPI.removePlaylistFromLibrary(
+            username: owner.id,
             playlistId: playlistId,
         )
 
-        // Remove from store on success
         store.removePlaylistFromUserLibrary(playlistId)
     }
 
-    /// Follow (save) a playlist to the user's library
-    func followPlaylist(playlistId: String, accessToken: String) async throws {
-        try await SpotifyAPI.followPlaylist(
-            accessToken: accessToken,
-            playlistId: playlistId,
-        )
+    /// Follows (saves) a playlist into the user's library.
+    func followPlaylist(playlistId: String) async throws {
+        let owner = try await requireProfile()
+        try await spclientAPI.addPlaylistToLibrary(username: owner.id, playlistId: playlistId)
 
-        // Update store on success
         store.addPlaylistToUserLibraryById(playlistId)
+    }
+
+    /// The rootlist is addressed by the account's own username, so library membership cannot be
+    /// changed before the profile has loaded. `UserProfile.id` *is* the username — see
+    /// `UserProfile.init(pathfinder:)`, which takes it straight from `profileAttributes`.
+    ///
+    /// **Fetches it rather than refusing.** The profile is loaded once at startup, on a path
+    /// that deliberately swallows its own failure — an app that cannot say who you are is still
+    /// an app that plays music — and nothing retried it. So one transient failure there left
+    /// create, delete, follow and unfollow throwing `accountUnknown` until the app was
+    /// relaunched, for a request none of them had ever made themselves. Through the registry,
+    /// so several writes arriving at once ask for it once.
+    private func requireProfile() async throws -> UserProfile {
+        if let profile = store.userProfile {
+            return profile
+        }
+
+        try await profileRequests.run(Self.profileKey) {
+            let profile = try await self.partnerAPI.profile()
+            self.store.setUserProfile(UserProfile(pathfinder: profile))
+        }
+
+        // A profile can arrive without the one field that matters — `UserProfile(pathfinder:)`
+        // is failable precisely because a nameless account cannot address a rootlist.
+        guard let profile = store.userProfile else {
+            throw SpclientError.accountUnknown
+        }
+        return profile
     }
 
     // MARK: - Track Operations
@@ -236,56 +311,54 @@ final class PlaylistService {
     func addTracksToPlaylist(
         playlistId: String,
         trackIds: [String],
-        accessToken: String,
     ) async throws {
-        let trackUris = trackIds.map { "spotify:track:\($0)" }
-
-        try await SpotifyAPI.addTracksToPlaylist(
-            accessToken: accessToken,
+        try await partnerAPI.addToPlaylist(
             playlistId: playlistId,
-            trackUris: trackUris,
+            trackUris: trackIds.map { "spotify:track:\($0)" },
         )
 
-        // Update store on success
+        // Optimistically, then reload. The mutation does not return the uids Spotify assigned,
+        // and a row without its real uid cannot be removed or reordered — so the placeholder
+        // rows exist only long enough for the refresh to replace them.
         for trackId in trackIds {
             store.addTrackToPlaylist(trackId, playlistId: playlistId)
         }
+
+        // A failed reload marks the contents stale on its own — see `reloadPlaylistTracks`.
+        try await reloadPlaylistTracks(playlistId: playlistId)
     }
 
-    /// Remove tracks from a playlist
-    func removeTracksFromPlaylist(
+    /// Remove **occurrences** from a playlist, named by uid.
+    ///
+    /// Not by track id, and there is deliberately no by-track-id variant to fall back to: a
+    /// playlist can hold the same song more than once, the Web API path this replaces removed
+    /// every copy of it, and the interim version here removed whichever copy came first. A uid
+    /// names the row the user actually chose, and every caller now has one.
+    func removePlaylistItems(
         playlistId: String,
-        trackIds: [String],
-        accessToken: String,
+        uids: [String],
     ) async throws {
-        let trackUris = trackIds.map { "spotify:track:\($0)" }
+        try await partnerAPI.removeFromPlaylist(playlistId: playlistId, uids: uids)
 
-        try await SpotifyAPI.removeTracksFromPlaylist(
-            accessToken: accessToken,
-            playlistId: playlistId,
-            trackUris: trackUris,
-        )
-
-        // Update store on success
-        for trackId in trackIds {
-            store.removeTrackFromPlaylist(trackId, playlistId: playlistId)
+        for uid in uids {
+            store.removePlaylistItem(uid: uid, playlistId: playlistId)
         }
     }
 
-    /// Reorder tracks in a playlist
-    func reorderPlaylistTracks(
+    /// Move one item to sit before another, both named by uid.
+    func movePlaylistItem(
         playlistId: String,
-        rangeStart: Int,
-        insertBefore: Int,
-        rangeLength: Int = 1,
-        accessToken: String,
+        uid: String,
+        beforeUid: String?,
     ) async throws {
-        try await SpotifyAPI.reorderPlaylistTracks(
-            accessToken: accessToken,
+        // No `beforeUid` means the end of the list, which the enum spells as its own move type
+        // rather than as a position.
+        let position = beforeUid.map(PlaylistItemPosition.before(uid:)) ?? .bottom
+
+        try await partnerAPI.moveInPlaylist(
             playlistId: playlistId,
-            rangeStart: rangeStart,
-            insertBefore: insertBefore,
-            rangeLength: rangeLength,
+            uids: [uid],
+            position: position,
         )
 
         // Re-fetch to pick up the order the server actually applied

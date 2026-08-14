@@ -98,61 +98,19 @@ extension Artist {
         name = artist.name
         uri = artist.uri
         images = artist.images
-        genres = artist.genres
         externalUrl = artist.externalUrl
-    }
-}
-
-// MARK: - User Profile Conversions
-
-extension UserProfile {
-    /// Convert from UserProfileCodable
-    init(from profile: UserProfileCodable) {
-        id = profile.id
-        displayName = profile.displayName ?? profile.id
-        imageURL = profile.images?.first.flatMap { URL(string: $0.url) }
-        externalUrl = profile.externalUrls?.spotify
-        uri = profile.uri
     }
 }
 
 // MARK: - Playlist Conversions
 
-extension Playlist {
-    /// Convert from APIPlaylist
-    init(from playlist: APIPlaylist) {
-        self.init(
-            id: playlist.id,
-            name: playlist.name,
-            description: playlist.description,
-            images: playlist.images,
-            uri: playlist.uri,
-            isPublic: playlist.isPublic ?? true,
-            ownerId: playlist.ownerId,
-            ownerName: playlist.ownerName,
-            externalUrl: playlist.externalUrl,
-            trackIds: [],
-            totalDurationMs: playlist.totalDurationMs,
-            knownTrackCount: playlist.trackCount,
-        )
-    }
-
-    /// Create with explicit track IDs (when loading playlist details with tracks)
-    init(from playlist: APIPlaylist, trackIds: [String], totalDurationMs: Int?) {
-        self.init(
-            id: playlist.id,
-            name: playlist.name,
-            description: playlist.description,
-            images: playlist.images,
-            uri: playlist.uri,
-            isPublic: playlist.isPublic ?? true,
-            ownerId: playlist.ownerId,
-            ownerName: playlist.ownerName,
-            externalUrl: playlist.externalUrl,
-            trackIds: trackIds,
-            totalDurationMs: totalDurationMs,
-            knownTrackCount: nil, // We have actual tracks
-            tracksLoaded: true,
-        )
+extension String? {
+    /// Spotify's playlist list answers with the literal string `"null"` when a playlist has no
+    /// description, and the detail header rendered it verbatim — the view's `?? ""` never saw a
+    /// nil to fall back from. Normalised at the entity boundary rather than in the view, so
+    /// every reader gets the same answer.
+    var normalizedPlaylistDescription: String? {
+        guard let self, self != "null", !self.isEmpty else { return nil }
+        return self
     }
 }

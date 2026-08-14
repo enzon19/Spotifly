@@ -9,7 +9,6 @@ import AppKit
 import SwiftUI
 
 struct NowPlayingBarView: View {
-    @Environment(SpotifySession.self) private var session
     @Environment(AppStore.self) private var store
     @Environment(NavigationCoordinator.self) private var navigationCoordinator
     @Environment(TrackService.self) private var trackService
@@ -376,9 +375,8 @@ struct NowPlayingBarView: View {
         Button {
             Task {
                 guard let trackId = currentTrackId else { return }
-                let token = await session.validAccessToken()
                 do {
-                    try await trackService.toggleFavorite(trackId: trackId, accessToken: token)
+                    try await trackService.toggleFavorite(trackId: trackId)
                 } catch {
                     playbackViewModel.errorMessage = "Failed to update favorite: \(error.localizedDescription)"
                 }
@@ -404,10 +402,25 @@ struct NowPlayingBarView: View {
         }
     }
 
+    /// Resolves the heart for whatever is playing.
+    ///
+    /// `ensureFavoriteStatuses`, not `refreshFavoriteStatuses`: this runs from `.task(id:)`,
+    /// which restarts every time the view *appears*, not only when the track changes — and this
+    /// bar re-appears often, since it is an overlay on a region that swaps between two- and
+    /// three-column layouts as you navigate. A forced refresh made each of those a real
+    /// `/me/tracks/contains` request: one continuously playing track drew seven of them in under
+    /// two minutes, all returning the same answer.
+    ///
+    /// What that costs is picking up a favorite toggled on another device while this track plays.
+    /// It is a fair trade — every other list in the app already resolves statuses through the
+    /// cache, so this makes the bar consistent rather than uniquely stale — and the real fix is
+    /// Spotify's collection change feed, which already arrives over Mercury and is dropped
+    /// unread (`plans/single-grant-partner-api.md`, task 12). Polling on view re-appearance was
+    /// never going to be the right mechanism for that.
     private func resolveCurrentTrackFavoriteStatusIfNeeded() async {
         guard let trackId = currentTrackId else { return }
 
-        await trackService.refreshFavoriteStatuses(trackIds: [trackId])
+        await trackService.ensureFavoriteStatuses(trackIds: [trackId])
     }
 
     /// Unified volume (0-100 scale).
@@ -434,6 +447,17 @@ struct NowPlayingBarView: View {
         playbackViewModel.volume = volume / 100
     }
 
+    /// Whether the device being controlled refuses volume changes.
+    ///
+    /// Only ever true for a *remote* device: the local player's volume is this app's own, and
+    /// nothing can decline it. An iPhone declares it, because iOS will not let one app set
+    /// system volume for another — which the app previously discovered by sending the command
+    /// and reading `400 DEVICE_DOES_NOT_SUPPORT_COMMAND` off the reply, having already let the
+    /// user drag the slider somewhere it would not stay.
+    private var volumeRefused: Bool {
+        playbackViewModel.remoteVolume != nil && store.activeDevice?.disableVolume == true
+    }
+
     private var volumeControl: some View {
         Button {
             showVolumePopover.toggle()
@@ -444,24 +468,37 @@ struct NowPlayingBarView: View {
         }
         .buttonStyle(.plain)
         .popover(isPresented: $showVolumePopover, arrowEdge: .bottom) {
-            HStack(spacing: 8) {
-                Image(systemName: "speaker.fill")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            VStack(spacing: 6) {
+                HStack(spacing: 8) {
+                    Image(systemName: "speaker.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
 
-                Slider(
-                    value: Binding(
-                        get: { currentVolume },
-                        set: { setVolume($0) },
-                    ),
-                    in: 0 ... 100,
-                )
-                .tint(.green)
-                .frame(width: 120)
+                    Slider(
+                        value: Binding(
+                            get: { currentVolume },
+                            set: { setVolume($0) },
+                        ),
+                        in: 0 ... 100,
+                    )
+                    .tint(.green)
+                    .frame(width: 120)
+                    .disabled(volumeRefused)
 
-                Image(systemName: "speaker.wave.3.fill")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    Image(systemName: "speaker.wave.3.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .opacity(volumeRefused ? 0.5 : 1)
+
+                // A greyed-out slider says "not now"; it does not say the device is the reason.
+                if volumeRefused {
+                    Text("volume.device_controls_itself \(store.activeDevice?.name ?? "")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: 180)
+                        .multilineTextAlignment(.center)
+                }
             }
             .padding(12)
         }
@@ -489,6 +526,10 @@ struct NowPlayingBarView: View {
                     track: track,
                     currentSection: .queue,
                     selectionId: nil,
+                    // The now-playing bar knows the song, never which playlist row it came
+                    // from — and with no playlist selected there is nothing to remove from
+                    // anyway.
+                    itemUid: nil,
                     playbackViewModel: playbackViewModel,
                     showNewPlaylistDialog: $showNewPlaylistDialog,
                     onPlaylistAdded: showSuccessFeedback,
@@ -529,19 +570,13 @@ struct NowPlayingBarView: View {
 
         Task {
             do {
-                let token = await session.validAccessToken()
-
                 // Create the playlist using PlaylistService
-                let newPlaylist = try await playlistService.createPlaylist(
-                    name: trimmedName,
-                    accessToken: token,
-                )
+                let newPlaylist = try await playlistService.createPlaylist(name: trimmedName)
 
                 // Add the track to the new playlist
                 try await playlistService.addTracksToPlaylist(
                     playlistId: newPlaylist.id,
                     trackIds: [track.id],
-                    accessToken: token,
                 )
 
                 showSuccessFeedback()

@@ -2,69 +2,137 @@
 //  QueueBootstrapTests.swift
 //  SpotiflyTests
 //
-//  What the Web API bootstrap is allowed to conclude from a response.
+//  What the bootstrap is allowed to conclude from a cluster snapshot.
 //
 
 import Foundation
 @testable import Spotifly
 import Testing
 
-/// A Web API bootstrap that finds no playback must leave the queue alone.
+/// A bootstrap that finds no playback must leave the queue alone.
 ///
-/// Spotify answers `/me/player` and `/me/player/queue` with 204 while no device is active,
-/// which decodes to exactly the same values as "nothing is queued". Reading that as an
-/// empty queue is what emptied the queue on every wake from sleep — see
+/// The source changed — this used to read `/me/player` and `/me/player/queue`, which answered
+/// 204 while no device was active — but the hazard did not: an answer meaning "I have nothing
+/// to tell you" is shaped exactly like one meaning "nothing is queued", and applying the second
+/// when you were handed the first is what emptied the queue on every wake from sleep. See
 /// `plans/wake-from-sleep-loses-queue-and-resume.md`.
+///
+/// Now the two forms are a **nil** snapshot, meaning no cluster update has arrived, and a
+/// snapshot with nothing playing and nothing pending.
 @MainActor
 struct QueueBootstrapTests {
-    private func decode<T: Decodable>(_ json: String) throws -> T {
-        try JSONDecoder().decode(T.self, from: Data(json.utf8))
+    private func item(_ id: String, provider: String = "context") -> QueueItem {
+        QueueItem(
+            id: "spotify:track:\(id)",
+            uri: "spotify:track:\(id)",
+            name: "Track \(id)",
+            artistName: "Artist",
+            imageURLString: "",
+            durationMs: 1000,
+            albumId: nil,
+            artistId: nil,
+            externalUrl: nil,
+            provider: provider,
+        )
     }
 
-    private func playbackState(_ json: String) throws -> SpotifyAPI.PlaybackStateResponse {
-        try decode(json)
+    /// The cold-start case: nothing has been pushed yet, which is not the same as being told
+    /// that nothing is playing.
+    @Test func `no snapshot at all carries no playback`() {
+        #expect(QueueService.queueUpdate(from: nil) == nil)
     }
 
-    private func queueResponse(_ json: String) throws -> SpotifyAPI.QueueResponse {
-        try decode(json)
+    @Test func `an empty snapshot carries no playback`() {
+        let empty = QueueState(currentTrack: nil, nextTracks: [], previousTracks: [])
+
+        #expect(QueueService.queueUpdate(from: empty) == nil)
     }
 
-    private static let track = """
-    {"id": "t1", "name": "Track", "uri": "spotify:track:t1", "duration_ms": 1000}
-    """
+    /// History alone is exactly what a wiped queue looks like, so it is not enough to apply.
+    @Test func `previous tracks alone carry no playback`() {
+        let snapshot = QueueState(
+            currentTrack: nil,
+            nextTracks: [],
+            previousTracks: [item("played")],
+        )
 
-    @Test func `a pair of 204s carries no playback`() throws {
-        // What `fetchPlaybackState` and `fetchQueue` produce from 204 No Content.
-        let empty = try queueResponse(#"{"currently_playing": null, "queue": []}"#)
-
-        #expect(!QueueService.responseCarriesPlayback(playbackState: nil, queueResponse: empty))
+        #expect(QueueService.queueUpdate(from: snapshot) == nil)
     }
 
-    @Test func `a playback state alone carries playback`() throws {
-        // /me/player answered while /me/player/queue happened to come back empty.
-        let state = try playbackState(#"{"is_playing": false}"#)
-        let empty = try queueResponse(#"{"currently_playing": null, "queue": []}"#)
+    @Test func `a current track alone carries playback`() throws {
+        let snapshot = QueueState(currentTrack: item("playing"), nextTracks: [], previousTracks: [])
+        let update = try #require(QueueService.queueUpdate(from: snapshot))
 
-        #expect(QueueService.responseCarriesPlayback(playbackState: state, queueResponse: empty))
-    }
-
-    @Test func `a currently playing track alone carries playback`() throws {
-        let queue = try queueResponse(#"{"currently_playing": \#(Self.track), "queue": []}"#)
-
-        #expect(QueueService.responseCarriesPlayback(playbackState: nil, queueResponse: queue))
+        #expect(update.current?.trackId == "playing")
+        #expect(update.next.isEmpty)
     }
 
     @Test func `pending tracks alone carry playback`() throws {
-        // Nothing is playing but Spotify still knows what is queued — that is an answer,
+        // Nothing is playing but the cluster still knows what is queued — that is an answer,
         // not the absence of one, so it may be applied.
-        let queue = try queueResponse(#"{"currently_playing": null, "queue": [\#(Self.track)]}"#)
+        let snapshot = QueueState(currentTrack: nil, nextTracks: [item("pending")], previousTracks: [])
+        let update = try #require(QueueService.queueUpdate(from: snapshot))
 
-        #expect(QueueService.responseCarriesPlayback(playbackState: nil, queueResponse: queue))
+        #expect(update.current == nil)
+        #expect(update.next.map(\.trackId) == ["pending"])
     }
 
-    @Test func `a paused local queue is exactly what a 204 pair would destroy`() {
-        // The state this bug was found in: history, a current track, and pending tracks,
-        // none of which the Web API can see once the device goes inactive.
+    /// **Previous tracks survive the move.** `/me/player/queue` returned none at all, so the
+    /// Web API bootstrap had to pass `previous: nil` and leave history to be refilled by
+    /// something else. The cluster carries it.
+    @Test func `history comes back with the rest`() throws {
+        let snapshot = QueueState(
+            currentTrack: item("playing"),
+            nextTracks: [item("pending")],
+            previousTracks: [item("played")],
+        )
+        let update = try #require(QueueService.queueUpdate(from: snapshot))
+
+        #expect(update.previous.map(\.trackId) == ["played"])
+        #expect(update.current?.trackId == "playing")
+        #expect(update.next.map(\.trackId) == ["pending"])
+    }
+
+    /// The cluster can name things this app has no row for, and a queue is not a reason to
+    /// invent one.
+    @Test func `items that are not tracks are dropped`() throws {
+        let episode = QueueItem(
+            id: "spotify:episode:e1",
+            uri: "spotify:episode:e1",
+            name: "Episode",
+            artistName: "",
+            imageURLString: "",
+            durationMs: 1000,
+            albumId: nil,
+            artistId: nil,
+            externalUrl: nil,
+            provider: "context",
+        )
+        let snapshot = QueueState(
+            currentTrack: item("playing"),
+            nextTracks: [episode, item("pending")],
+            previousTracks: [],
+        )
+        let update = try #require(QueueService.queueUpdate(from: snapshot))
+
+        #expect(update.next.map(\.trackId) == ["pending"])
+    }
+
+    /// The provider rides along, because the queue view distinguishes a track queued by hand
+    /// from one the context supplied.
+    @Test func `the provider survives the conversion`() throws {
+        let snapshot = QueueState(
+            currentTrack: nil,
+            nextTracks: [item("queued", provider: "queue")],
+            previousTracks: [],
+        )
+        let update = try #require(QueueService.queueUpdate(from: snapshot))
+
+        #expect(update.next.first?.provider == .queue)
+    }
+
+    @Test func `a paused local queue is exactly what an empty snapshot would destroy`() {
+        // The state this bug was found in: history, a current track, and pending tracks.
         let store = AppStore()
         store.setQueue(
             previous: [QueueEntry(trackId: "played", provider: .context)],
@@ -72,7 +140,7 @@ struct QueueBootstrapTests {
             next: [QueueEntry(trackId: "pending", provider: .context)],
         )
 
-        // Applying an empty response keeps the history and drops everything that matters.
+        // Applying an empty update keeps the history and drops everything that matters.
         store.setQueue(previous: nil, current: nil, next: [])
 
         #expect(store.queue.previousTracks.map(\.trackId) == ["played"])
@@ -80,5 +148,91 @@ struct QueueBootstrapTests {
         #expect(store.queue.nextTracks.isEmpty)
         // And the pointer is now unrepairable: the track is no longer in the list.
         #expect(!store.reconcileQueueCurrentTrack(with: "playing"))
+    }
+}
+
+/// Which row of a list is drawn as playing.
+///
+/// A list can legitimately hold the same recording twice — an album with a reprise, a playlist
+/// a track was added to twice, or two catalogue entries that relink to one market id. Deciding
+/// by uri lights up all of them, which is what drew two rows of an 11-track queue green while
+/// only one of them advanced.
+@MainActor
+struct CurrentRowIdentityTests {
+    /// The queue knows a current *position*, so position is what it uses.
+    @Test func `only the row at the current index is current`() {
+        let currentIndex = 0
+        let uris = [
+            "spotify:track:street",
+            "spotify:track:away",
+            "spotify:track:street",
+        ]
+
+        let flags = uris.indices.map { index in
+            TrackRow.isCurrent(index: index, currentIndex: currentIndex, uri: uris[index], playingUri: uris[0])
+        }
+
+        #expect(flags == [true, false, false])
+    }
+
+    @Test func `a later position is current when playback has advanced`() {
+        let uris = ["spotify:track:street", "spotify:track:away", "spotify:track:street"]
+
+        let flags = uris.indices.map { index in
+            TrackRow.isCurrent(index: index, currentIndex: 2, uri: uris[index], playingUri: uris[2])
+        }
+
+        #expect(flags == [false, false, true])
+    }
+
+    /// Lists with no current position — an album page, a playlist, search results — have
+    /// nothing better than the uri to go on, and keep the old behaviour.
+    @Test func `without a current index the uri decides`() {
+        #expect(TrackRow.isCurrent(index: 3, currentIndex: nil, uri: "spotify:track:a", playingUri: "spotify:track:a"))
+        #expect(!TrackRow.isCurrent(index: 3, currentIndex: nil, uri: "spotify:track:a", playingUri: "spotify:track:b"))
+    }
+
+    @Test func `a row with no index at all falls back to the uri`() {
+        #expect(TrackRow.isCurrent(index: nil, currentIndex: 0, uri: "spotify:track:a", playingUri: "spotify:track:a"))
+    }
+}
+
+/// Telling Spotify declining from something being wrong.
+///
+/// Thirteen of twenty-eight commands in one measured session failed, and every one was a
+/// control the user had pressed deliberately against a device or a state that would not take
+/// it. Reporting those as errors makes a working app look broken.
+struct DeclinedCommandTests {
+    @Test func `a restricted skip is a decline, not a failure`() {
+        let error = SpclientError.requestFailed(
+            403,
+            #"{"error_code":"9","error_description":"skip_to_prev_restricted","reasons":["no_prev_track"]}"#,
+        )
+
+        #expect(error.isDeclined)
+        #expect(error.isNoPreviousTrack)
+    }
+
+    /// An iPhone will not take a remote volume change — iOS policy, not a Spotify one.
+    @Test func `an unsupported command is a decline, not a failure`() {
+        let error = SpclientError.requestFailed(400, #"{"error_type":"DEVICE_DOES_NOT_SUPPORT_COMMAND"}"#)
+
+        #expect(error.isDeclined)
+        #expect(!error.isNoPreviousTrack)
+    }
+
+    @Test func `a genuine failure is still a failure`() {
+        let missing = SpclientError.requestFailed(404, #"{"error_type":"DEVICE_NOT_FOUND"}"#)
+        let broken = SpclientError.requestFailed(500, "")
+
+        #expect(!missing.isDeclined)
+        #expect(!broken.isDeclined)
+    }
+
+    @Test func `the body is carried into the message so a log says why`() {
+        let error = SpclientError.requestFailed(400, #"{"error_type":"DEVICE_DOES_NOT_SUPPORT_COMMAND"}"#)
+
+        #expect(error.localizedDescription.contains("400"))
+        #expect(error.localizedDescription.contains("DEVICE_DOES_NOT_SUPPORT_COMMAND"))
     }
 }

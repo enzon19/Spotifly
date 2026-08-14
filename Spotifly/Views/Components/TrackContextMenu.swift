@@ -12,10 +12,11 @@ struct TrackContextMenu: View {
     let track: Track
     let currentSection: NavigationItem
     let selectionId: String?
+    /// The playlist item this menu was opened from, where the caller knows which one.
+    let itemUid: String?
     @Bindable var playbackViewModel: PlaybackViewModel
 
     @Environment(NavigationCoordinator.self) private var navigationCoordinator
-    @Environment(SpotifySession.self) private var session
     @Environment(AppStore.self) private var store
     @Environment(TrackService.self) private var trackService
     @Environment(PlaylistService.self) private var playlistService
@@ -29,18 +30,26 @@ struct TrackContextMenu: View {
         store.isFavorite(track.id)
     }
 
-    /// The playlist this row is being shown *inside*, if the user can edit it.
-    /// Removing is only offered there: the menu is reused from albums, search and
-    /// the queue, where "this playlist" would mean nothing, and Spotify rejects the
-    /// edit for a playlist someone else owns.
-    private var removableFromPlaylistId: String? {
+    /// The row to remove, when there is one the user can remove and this menu can name.
+    ///
+    /// Removing is only offered inside a playlist the user owns: the menu is reused from
+    /// albums, search and the queue, where "this playlist" would mean nothing, and Spotify
+    /// rejects the edit for a playlist someone else owns.
+    ///
+    /// **The uid is required, not preferred.** Without it the menu can only say "a row holding
+    /// this song", and a playlist may hold the same song twice — so the removal would land on
+    /// whichever copy came first rather than the one the user right-clicked. Requiring it makes
+    /// that unrepresentable instead of a fallback: the only screen that offers this is the
+    /// playlist page, and it has the uid.
+    private var removableItem: (playlistId: String, uid: String)? {
         guard currentSection == .playlists,
               let playlistId = selectionId,
+              let itemUid,
               store.playlists[playlistId]?.ownerId == store.userId
         else {
             return nil
         }
-        return playlistId
+        return (playlistId, itemUid)
     }
 
     var body: some View {
@@ -78,7 +87,6 @@ struct TrackContextMenu: View {
             }
 
             PlaylistSubmenuContent(
-                session: session,
                 store: store,
                 playlistService: playlistService,
                 onAddToPlaylist: addToPlaylist,
@@ -87,9 +95,9 @@ struct TrackContextMenu: View {
             Label("track.menu.add_to_playlist", systemImage: "music.note.list")
         }
 
-        if let playlistId = removableFromPlaylistId {
+        if let item = removableItem {
             Button(role: .destructive) {
-                removeFromPlaylist(playlistId: playlistId)
+                removeFromPlaylist(playlistId: item.playlistId, uid: item.uid)
             } label: {
                 Label("track.menu.remove_from_playlist", systemImage: "minus.circle")
             }
@@ -138,11 +146,7 @@ struct TrackContextMenu: View {
 
     private func addToQueue() {
         Task {
-            let token = await session.validAccessToken()
-            await playbackViewModel.addToQueue(
-                uri: track.uri,
-                accessToken: token,
-            )
+            await playbackViewModel.addToQueue(uri: track.uri)
         }
     }
 
@@ -157,11 +161,7 @@ struct TrackContextMenu: View {
     private func toggleFavorite() {
         Task {
             do {
-                let token = await session.validAccessToken()
-                try await trackService.toggleFavorite(
-                    trackId: track.id,
-                    accessToken: token,
-                )
+                try await trackService.toggleFavorite(trackId: track.id)
             } catch {
                 playbackViewModel.errorMessage = "Failed to update favorite: \(error.localizedDescription)"
             }
@@ -171,11 +171,9 @@ struct TrackContextMenu: View {
     private func addToPlaylist(playlistId: String) {
         Task {
             do {
-                let token = await session.validAccessToken()
                 try await playlistService.addTracksToPlaylist(
                     playlistId: playlistId,
                     trackIds: [track.id],
-                    accessToken: token,
                 )
                 onPlaylistAdded?()
             } catch {
@@ -184,14 +182,12 @@ struct TrackContextMenu: View {
         }
     }
 
-    private func removeFromPlaylist(playlistId: String) {
+    private func removeFromPlaylist(playlistId: String, uid: String) {
         Task {
             do {
-                let token = await session.validAccessToken()
-                try await playlistService.removeTracksFromPlaylist(
+                try await playlistService.removePlaylistItems(
                     playlistId: playlistId,
-                    trackIds: [track.id],
-                    accessToken: token,
+                    uids: [uid],
                 )
             } catch {
                 playbackViewModel.errorMessage = "Failed to remove from playlist: \(error.localizedDescription)"
@@ -208,11 +204,13 @@ extension TrackContextMenu {
         track: Track,
         currentSection: NavigationItem = .startpage,
         selectionId: String? = nil,
+        itemUid: String? = nil,
         playbackViewModel: PlaybackViewModel,
     ) {
         self.track = track
         self.currentSection = currentSection
         self.selectionId = selectionId
+        self.itemUid = itemUid
         self.playbackViewModel = playbackViewModel
         _showNewPlaylistDialog = .constant(false)
         onPlaylistAdded = nil
@@ -224,7 +222,6 @@ extension TrackContextMenu {
 
 /// A view that loads playlists on-demand when the submenu appears
 private struct PlaylistSubmenuContent: View {
-    let session: SpotifySession
     let store: AppStore
     let playlistService: PlaylistService
     let onAddToPlaylist: (String) -> Void

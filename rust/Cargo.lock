@@ -2475,9 +2475,9 @@ version = "0.1.0"
 dependencies = [
  "env_logger",
  "futures-util",
+ "http",
  "librespot-connect",
  "librespot-core",
- "librespot-oauth",
  "librespot-playback",
  "librespot-protocol",
  "log",

@@ -177,7 +177,6 @@ struct Artist: Identifiable, Hashable, Encodable {
     let name: String
     let uri: String
     let images: ImageSet
-    let genres: [String]
     let externalUrl: String?
 }
 
@@ -196,20 +195,25 @@ struct Playlist: Identifiable, Hashable, Encodable {
     let externalUrl: String?
 
     // Mutable state (populated when tracks are loaded)
-    var trackIds: [String]
+    var items: [PlaylistItem]
     var totalDurationMs: Int?
 
     /// Whether the track list was fetched. Stored rather than derived from
-    /// `trackIds`, so an empty playlist — or one the user just emptied — is not
+    /// `items`, so an empty playlist — or one the user just emptied — is not
     /// re-fetched on every single visit.
     var tracksLoaded: Bool
 
     /// Known count from API (before tracks are loaded)
     private var _knownTrackCount: Int?
 
-    /// Track count - uses loaded trackIds if available, otherwise falls back to API count
+    /// Track count - uses loaded items if available, otherwise falls back to API count
     var trackCount: Int {
-        tracksLoaded ? trackIds.count : (_knownTrackCount ?? 0)
+        tracksLoaded ? items.count : (_knownTrackCount ?? 0)
+    }
+
+    /// The tracks in order, for the many readers that do not care which occurrence is which.
+    var trackIds: [String] {
+        items.map(\.trackId)
     }
 
     var formattedDuration: String? {
@@ -228,7 +232,7 @@ struct Playlist: Identifiable, Hashable, Encodable {
         ownerId: String,
         ownerName: String,
         externalUrl: String? = nil,
-        trackIds: [String] = [],
+        items: [PlaylistItem] = [],
         totalDurationMs: Int? = nil,
         knownTrackCount: Int? = nil,
         tracksLoaded: Bool = false,
@@ -242,10 +246,65 @@ struct Playlist: Identifiable, Hashable, Encodable {
         self.ownerId = ownerId
         self.ownerName = ownerName
         self.externalUrl = externalUrl
-        self.trackIds = trackIds
+        self.items = items
         self.totalDurationMs = totalDurationMs
         self.tracksLoaded = tracksLoaded
         _knownTrackCount = knownTrackCount
+    }
+}
+
+/// One entry in a playlist: a track, and the id of *this occurrence* of it.
+///
+/// The `uid` is what the client's own API mutates by — `removeFromPlaylist` and
+/// `moveItemsInPlaylist` both take uids, not track uris — and it is why a playlist holds items
+/// rather than plain track ids.
+///
+/// It also fixes a defect the Web API path had: removing by track uri deletes **every** copy of
+/// that track in the playlist, so a playlist holding the same song twice lost both when the user
+/// removed one. A uid names one occurrence.
+struct PlaylistItem: Identifiable, Hashable, Encodable {
+    /// Stable per occurrence, assigned by Spotify.
+    let uid: String
+    let trackId: String
+
+    /// `Identifiable` on the uid rather than the track: two rows for the same song are two
+    /// rows, and a `ForEach` keyed by track id would treat them as one.
+    var id: String {
+        uid
+    }
+}
+
+// MARK: - Home
+
+/// One shelf of the start page: a heading, and ids into the entity tables.
+///
+/// **Holds ids rather than entities**, like every other ordered collection here, so a playlist
+/// renamed on the playlist page is renamed on the start page too. The entities themselves are
+/// upserted when the page loads.
+struct HomeSection: Identifiable, Hashable, Encodable {
+    /// Spotify's own `spotify:section:…` uri. Stable across loads, which is what lets SwiftUI
+    /// keep scroll position when the page refreshes.
+    let id: String
+    /// Absent for shelves Spotify draws without a heading — the "shorts" row is one.
+    let title: String?
+    let items: [HomeItem]
+}
+
+/// What a shelf entry points at. Deliberately only the three kinds this app can open: a row
+/// leading nowhere is worse than a row that is not there.
+enum HomeItem: Identifiable, Hashable, Encodable {
+    case album(String)
+    case playlist(String)
+    case artist(String)
+
+    /// Qualified by kind, because an album and a playlist can share a base62 id and a `ForEach`
+    /// would then treat them as the same row.
+    var id: String {
+        switch self {
+        case let .album(id): "album:\(id)"
+        case let .playlist(id): "playlist:\(id)"
+        case let .artist(id): "artist:\(id)"
+        }
     }
 }
 
@@ -271,6 +330,17 @@ struct Device: Identifiable, Hashable, Encodable {
     let isPrivateSession: Bool
     let isRestricted: Bool
     let volumePercent: Int?
+
+    /// Whether the device refuses remote volume changes, as the cluster declares.
+    ///
+    /// Named after the wire field rather than flipped to `canSetVolume`, so one term can be
+    /// followed from the protobuf through Rust, the FFI JSON and the codable to here without
+    /// a reader having to notice where the sense inverts.
+    ///
+    /// An iPhone sets it — iOS will not let an app change system volume for another app — and
+    /// the app used to find out only by sending the command and getting
+    /// `400 DEVICE_DOES_NOT_SUPPORT_COMMAND` back, after the user had already dragged the slider.
+    var disableVolume: Bool = false
 }
 
 // MARK: - Spotify Connection
@@ -386,7 +456,6 @@ struct PaginationState: Encodable {
     var isLoading = false
     var hasMore = true
     var nextOffset: Int? = 0
-    var nextCursor: String? // For cursor-based pagination (artists)
     var total: Int = 0
 
     mutating func reset() {
@@ -394,7 +463,26 @@ struct PaginationState: Encodable {
         isLoading = false
         hasMore = true
         nextOffset = 0
-        nextCursor = nil
         total = 0
+    }
+
+    /// Records a page that has arrived, and works out whether to ask for another.
+    ///
+    /// The Web API used to answer this directly, with a `next` URL that was null on the last
+    /// page. The client APIs report a `totalCount` instead and leave the arithmetic here, so the
+    /// offset advances by **how many entries came back**, not by how many the caller could use.
+    /// Those differ: a page of the library can hold folders, and a page of saved tracks can name
+    /// the same relinked recording twice. Advancing by the usable count would re-request the
+    /// difference on every page and never reach the end.
+    ///
+    /// `receivedCount == 0` ends the list whatever `total` claims — otherwise a total that
+    /// overcounts what the pages actually yield would leave `hasMore` true forever, and the
+    /// list views ask for more as long as it is.
+    mutating func advance(by receivedCount: Int, total: Int) {
+        let offset = (nextOffset ?? 0) + receivedCount
+
+        self.total = total
+        nextOffset = offset
+        hasMore = receivedCount > 0 && offset < total
     }
 }

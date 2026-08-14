@@ -13,16 +13,15 @@ import Foundation
 final class TrackService {
     private let store: AppStore
 
-    /// Used by the loading entry points and the favorite-status checks, which
-    /// often decide there is nothing to fetch. They take the token themselves,
-    /// *after* deciding, so a cache hit costs nothing.
-    private let tokenProvider: () async -> String
+    /// The favorites reads and writes, which take no token: `PartnerAPI` runs on the keymaster
+    /// grant and holds it itself.
+    private let partnerAPI: PartnerAPI
 
-    /// Injectable for tests; production uses Spotify's batched contains endpoint.
-    private let favoriteStatusFetcher: (_ accessToken: String, _ trackIds: [String]) async throws -> [String: Bool]
+    /// Injectable for tests; production asks pathfinder which of a batch are in the library.
+    private let favoriteStatusFetcher: (_ trackIds: [String]) async throws -> [String: Bool]
 
     /// The single metadata fetch path shared by queue hydration and current-track recovery.
-    private let metadataFetcher: (_ accessToken: String, _ trackIds: [String]) async throws -> [String: APITrack]
+    private let metadataFetcher: (_ trackIds: [String]) async throws -> [String: Track]
 
     /// The favorites list, whose pages are one run at a time under one key.
     private let listRequests = InFlightRequests<Void>()
@@ -31,7 +30,9 @@ final class TrackService {
     /// `/me/tracks/contains` checks, deduplicated per track ID.
     private let statusChecks = BatchInFlightRequests()
 
-    /// `/v1/tracks` metadata loads, deduplicated per track ID.
+    /// spclient metadata loads, deduplicated per track ID. Worth more than it was: one call
+    /// here is now one request *per track*, so a joined run saves a request rather than a slot
+    /// in someone else's batch.
     private let metadataLoads = BatchInFlightRequests()
 
     /// Track IDs a *successful* request came back without.
@@ -45,17 +46,17 @@ final class TrackService {
 
     init(
         store: AppStore,
-        tokenProvider: @escaping () async -> String,
-        favoriteStatusFetcher: @escaping (_ accessToken: String, _ trackIds: [String]) async throws -> [String: Bool] = { accessToken, trackIds in
-            try await SpotifyAPI.checkSavedTracks(accessToken: accessToken, trackIds: trackIds)
-        },
-        metadataFetcher: @escaping (_ accessToken: String, _ trackIds: [String]) async throws -> [String: APITrack] = { accessToken, trackIds in
-            try await SpotifyAPI.fetchTracks(accessToken: accessToken, trackIds: trackIds)
+        partnerAPI: PartnerAPI = PartnerAPI(),
+        favoriteStatusFetcher: ((_ trackIds: [String]) async throws -> [String: Bool])? = nil,
+        metadataFetcher: @escaping (_ trackIds: [String]) async throws -> [String: Track] = { trackIds in
+            try await SpclientAPI().trackEntities(ids: trackIds)
         },
     ) {
         self.store = store
-        self.tokenProvider = tokenProvider
-        self.favoriteStatusFetcher = favoriteStatusFetcher
+        self.partnerAPI = partnerAPI
+        self.favoriteStatusFetcher = favoriteStatusFetcher ?? { trackIds in
+            try await partnerAPI.entitiesInLibrary(uris: trackIds.map { "spotify:track:\($0)" })
+        }
         self.metadataFetcher = metadataFetcher
     }
 
@@ -63,10 +64,11 @@ final class TrackService {
 
     /// Ensures every available track in `trackIds` is present in the normalized store.
     ///
-    /// Cache hits return before requesting a token. Overlapping callers join any request
+    /// Cache hits return before anything is fetched. Overlapping callers join any request
     /// already carrying an ID and fetch only the uncovered remainder. A failed run removes
     /// its entries, so a later call retries normally, while an ID Spotify answered without
-    /// is not asked for again.
+    /// is not asked for again — which is why `SpclientAPI.tracks` is careful to report only a
+    /// genuine 404 as an absence, and to throw on anything that might not recur.
     func ensureTracksLoaded(trackIds: [String]) async throws {
         let missingTrackIds = uniqueTrackIds(trackIds).filter {
             store.tracks[$0] == nil && !unavailableTrackIds.contains($0)
@@ -74,9 +76,8 @@ final class TrackService {
         guard !missingTrackIds.isEmpty else { return }
 
         try await metadataLoads.run(missingTrackIds) { uncoveredTrackIds in
-            let accessToken = await self.tokenProvider()
-            let fetched = try await self.metadataFetcher(accessToken, uncoveredTrackIds)
-            self.store.upsertTracks(uncoveredTrackIds.compactMap { fetched[$0] }.map { Track(from: $0) })
+            let fetched = try await self.metadataFetcher(uncoveredTrackIds)
+            self.store.upsertTracks(uncoveredTrackIds.compactMap { fetched[$0] })
             self.unavailableTrackIds.formUnion(uncoveredTrackIds.filter { fetched[$0] == nil })
         }
     }
@@ -105,7 +106,6 @@ final class TrackService {
 
         try await listRequests.run(Self.listKey) {
             let offset = self.store.favoritesPagination.nextOffset ?? 0
-            let accessToken = await self.tokenProvider()
             self.store.favoritesPagination.isLoading = true
             defer {
                 // Only if this run is still the one loading: a superseded run
@@ -115,15 +115,11 @@ final class TrackService {
                 }
             }
 
-            let response = try await SpotifyAPI.fetchUserSavedTracks(
-                accessToken: accessToken,
-                limit: 50,
-                offset: offset,
-            )
+            let page = try await self.partnerAPI.libraryTracks(offset: offset, limit: 50)
             // See AlbumService.loadUserAlbums: a superseded run must not write.
             try Task.checkCancellation()
 
-            let tracks = response.tracks.map { Track(from: $0) }
+            let tracks = page.tracks
             self.store.upsertTracks(tracks)
 
             let trackIds = tracks.map(\.id)
@@ -135,9 +131,14 @@ final class TrackService {
             self.store.markTracksAsFavorite(trackIds)
 
             self.store.favoritesPagination.isLoaded = true
-            self.store.favoritesPagination.hasMore = response.hasMore
-            self.store.favoritesPagination.nextOffset = response.nextOffset
-            self.store.favoritesPagination.total = response.total
+            // By the page's entry count, not by the track count: relinking is many-to-one, so
+            // several saved entries can resolve to one recording and the list is legitimately
+            // shorter than the page. Advancing by the shorter number would ask for the
+            // difference again on every page.
+            self.store.favoritesPagination.advance(
+                by: page.items?.count ?? 0,
+                total: page.totalCount ?? 0,
+            )
         }
     }
 
@@ -151,8 +152,13 @@ final class TrackService {
 
     // MARK: - Favorite Toggling (Optimistic)
 
-    /// Toggle favorite status for a track (optimistic update)
-    func toggleFavorite(trackId: String, accessToken: String) async throws {
+    /// Toggle favorite status for a track (optimistic update).
+    ///
+    /// The write goes out with the id the store holds, which is the **market** id — the one
+    /// pathfinder returned. Spotify's docs warn that a relinked substitute "will likely return
+    /// an error" for saves; measured on 2026-08-13, it does not, and the collection service
+    /// echoes the change back under that same id. See `AGENTS.md`.
+    func toggleFavorite(trackId: String) async throws {
         let wasOriginallyFavorite = store.isFavorite(trackId)
 
         // Optimistic update - immediately update UI
@@ -162,12 +168,14 @@ final class TrackService {
             store.addTrackToFavorites(trackId)
         }
 
+        let uris = ["spotify:track:\(trackId)"]
+
         do {
             // Make API call
             if wasOriginallyFavorite {
-                try await SpotifyAPI.removeSavedTrack(accessToken: accessToken, trackId: trackId)
+                try await partnerAPI.removeFromLibrary(uris: uris)
             } else {
-                try await SpotifyAPI.saveTrack(accessToken: accessToken, trackId: trackId)
+                try await partnerAPI.addToLibrary(uris: uris)
             }
         } catch {
             // Rollback on failure
@@ -182,13 +190,18 @@ final class TrackService {
 
     // MARK: - Favorite Status Check
 
-    /// The one request the checks below are built out of. Private so every caller
-    /// goes through `ensureFavoriteStatuses`/`refreshFavoriteStatuses` and is
-    /// deduplicated against `checksInFlight`.
-    private func checkFavoriteStatuses(trackIds: [String], accessToken: String) async throws {
+    /// The one request the checks below are built out of. Private so every caller goes
+    /// through `ensureFavoriteStatuses` and is deduplicated against `checksInFlight`.
+    ///
+    /// There was a `refreshFavoriteStatuses` beside it that skipped the resolved cache, for
+    /// callers wanting to re-ask. Its only caller was the Now Playing bar, firing on every view
+    /// re-appearance — seven identical requests for one track in under two minutes — so it was
+    /// removed with that call rather than left as a loaded gun. A genuine need to re-ask should
+    /// come from Spotify's collection change feed rather than from polling.
+    private func checkFavoriteStatuses(trackIds: [String]) async throws {
         guard !trackIds.isEmpty else { return }
 
-        let statuses = try await favoriteStatusFetcher(accessToken, trackIds)
+        let statuses = try await favoriteStatusFetcher(trackIds)
 
         store.updateFavoriteStatuses(statuses)
     }
@@ -202,22 +215,14 @@ final class TrackService {
         await check(unresolved)
     }
 
-    /// Refresh favorite status for the given tracks even if we have stale cached data.
-    func refreshFavoriteStatuses(trackIds: [String]) async {
-        // Deliberately ignores the resolved cache — that is the point of a refresh.
-        // `check` still joins any request already carrying the same track.
-        await check(uniqueTrackIds(trackIds))
-    }
-
     private func check(_ trackIds: [String]) async {
         guard !trackIds.isEmpty else { return }
 
         // A failed check is not worth reporting — the heart just stays as it was — so
         // the run swallows its own errors and `run` has nothing left to throw.
         try? await statusChecks.run(trackIds) { uncheckedTrackIds in
-            let accessToken = await self.tokenProvider()
             for batch in self.batches(of: uncheckedTrackIds, size: 50) {
-                try? await self.checkFavoriteStatuses(trackIds: batch, accessToken: accessToken)
+                try? await self.checkFavoriteStatuses(trackIds: batch)
             }
         }
     }

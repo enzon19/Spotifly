@@ -131,24 +131,15 @@ final class AppStore {
     /// enough to invalidate a route because a deep-linked entity may still be loading.
     private(set) var deletedEntitySelections: Set<Selection> = []
 
-    // MARK: - Recently Played State
+    // MARK: - Start Page State
 
-    private(set) var recentTrackIds: [String] = []
-    /// URIs of recent albums/artists/playlists (e.g., "spotify:album:123")
-    private(set) var recentItemURIs: [String] = []
-    var recentlyPlayedIsLoading = false
-    var recentlyPlayedErrorMessage: String?
-    var hasLoadedRecentlyPlayed = false
-
-    // MARK: - Top Items State
-
-    var topArtistIds: [String] = []
-    var topArtistsPagination = PaginationState()
-    var topArtistsErrorMessage: String?
-
-    var topTrackAlbumIds: [String] = []
-    var topTrackAlbumsPagination = PaginationState()
-    var topTrackAlbumsErrorMessage: String?
+    /// Spotify's own start page, as shelves of ids. One request fills all of it, so there is a
+    /// single loading flag and a single error rather than one per section.
+    private(set) var homeSections: [HomeSection] = []
+    private(set) var homeGreeting: String?
+    var homeIsLoading = false
+    var homeErrorMessage: String?
+    var hasLoadedHome = false
 
     // MARK: - Queue State
 
@@ -157,8 +148,9 @@ final class AppStore {
 
     // MARK: - Device Loading State
 
+    /// True until the first cluster update arrives. Not a request in flight — the device list
+    /// is pushed, so there is nothing to fail and no error to show; there is only "not yet".
     var devicesIsLoading = false
-    var devicesErrorMessage: String?
 
     // MARK: - User Profile
 
@@ -200,38 +192,6 @@ final class AppStore {
     /// Available Spotify devices
     var availableDevices: [Device] {
         Array(devices.values)
-    }
-
-    /// Recent tracks from the store
-    var recentTracks: [Track] {
-        recentTrackIds.compactMap { tracks[$0] }
-    }
-
-    /// Top artists from the store
-    var topArtists: [Artist] {
-        topArtistIds.compactMap { artists[$0] }
-    }
-
-    /// Top albums derived from top tracks
-    var topTrackAlbums: [Album] {
-        topTrackAlbumIds.compactMap { albums[$0] }
-    }
-
-    /// Recent albums and playlists (excludes artists) from URIs
-    var recentAlbumsAndPlaylists: [(id: String, album: Album?, playlist: Playlist?)] {
-        recentItemURIs.compactMap { uri -> (id: String, album: Album?, playlist: Playlist?)? in
-            if uri.hasPrefix("spotify:album:") {
-                let id = String(uri.dropFirst("spotify:album:".count))
-                guard let album = albums[id] else { return nil }
-                return (id: uri, album: album, playlist: nil)
-            } else if uri.hasPrefix("spotify:playlist:") {
-                let id = String(uri.dropFirst("spotify:playlist:".count))
-                guard let playlist = playlists[id] else { return nil }
-                return (id: uri, album: nil, playlist: playlist)
-            }
-            // Skip artists
-            return nil
-        }
     }
 
     // MARK: - Queue Computed Properties
@@ -307,8 +267,9 @@ final class AppStore {
     }
 
     /// Upsert a single album. What we already know is never downgraded: a stub
-    /// entity (the one `TopItemsService` builds from a track's album object) does
-    /// not replace fully fetched metadata, and no upsert drops loaded tracks.
+    /// entity (the one the start page builds out of a shelf entry, which carries no
+    /// release date or album type) does not replace fully fetched metadata, and no
+    /// upsert drops loaded tracks.
     func upsertAlbum(_ album: Album) {
         deletedEntitySelections.remove(.album(id: album.id))
         guard let existing = albums[album.id] else {
@@ -367,29 +328,56 @@ final class AppStore {
         artistAlbumIds[artistId]?.compactMap { albums[$0] }
     }
 
-    /// Upsert a single playlist, preserving loaded tracks if present
+    /// Upsert a single playlist, preserving loaded tracks if present.
+    ///
+    /// A playlist arriving from the library list, search or the start page is a **summary**: it
+    /// carries no items, which says nothing about them rather than saying there are none. So it
+    /// never empties a list the store already holds.
+    ///
+    /// `tracksLoaded` is carried over rather than asserted. A list marked stale — an add whose
+    /// refresh failed, say — stays stale through a summary refresh, so the rows keep rendering
+    /// while the next visit still refetches them. Claiming `true` here is what let a routine
+    /// library refresh both erase those rows and declare the result loaded.
     func upsertPlaylist(_ playlist: Playlist) {
         deletedEntitySelections.remove(.playlist(id: playlist.id))
-        if let existing = playlists[playlist.id], existing.tracksLoaded, !playlist.tracksLoaded {
-            // Preserve existing trackIds and duration when new playlist doesn't have them
-            var merged = playlist
-            merged.trackIds = existing.trackIds
-            merged.totalDurationMs = existing.totalDurationMs
-            merged.tracksLoaded = true
-            playlists[playlist.id] = merged
-        } else {
+
+        guard let existing = playlists[playlist.id],
+              !playlist.tracksLoaded,
+              // A loaded playlist that is genuinely empty is preserved too, so it is not
+              // fetched again forever — see the "cache what was fetched" rule in AGENTS.md.
+              existing.tracksLoaded || !existing.items.isEmpty
+        else {
             playlists[playlist.id] = playlist
+            return
         }
+
+        var merged = playlist
+        merged.items = existing.items
+        merged.totalDurationMs = existing.totalDurationMs
+        merged.tracksLoaded = existing.tracksLoaded
+        playlists[playlist.id] = merged
     }
 
     /// Attach a fetched track list to a playlist. Marks it loaded even when the
     /// playlist is empty, so it is not fetched again on the next visit.
-    func setPlaylistTracks(_ trackIds: [String], totalDurationMs: Int?, for playlistId: String) {
+    func setPlaylistTracks(_ items: [PlaylistItem], totalDurationMs: Int?, for playlistId: String) {
         guard var playlist = playlists[playlistId] else { return }
-        playlist.trackIds = trackIds
+        playlist.items = items
         playlist.totalDurationMs = totalDurationMs
         playlist.tracksLoaded = true
         playlists[playlistId] = playlist
+    }
+
+    /// Marks a playlist's contents as needing a fetch, without emptying the list on screen.
+    ///
+    /// For the case where the rows in the store are known to be wrong: an add places its rows
+    /// under locally generated uids, and only a reload replaces them with Spotify's. If that
+    /// reload fails, the placeholders are left marked `tracksLoaded`, so nothing would ever
+    /// fetch them again — and a uid the service has never heard of cannot be removed or moved.
+    /// Clearing the flag rather than the items keeps the rows visible until a load replaces
+    /// them, which is what an optimistic update is for.
+    func invalidatePlaylistTracks(for playlistId: String) {
+        playlists[playlistId]?.tracksLoaded = false
     }
 
     /// Upsert multiple playlists, preserving loaded tracks if present
@@ -471,12 +459,29 @@ final class AppStore {
 
     /// Set saved track IDs for the Favorites section (replaces existing list order only)
     func setSavedTrackIds(_ ids: [String]) {
-        savedTrackIds = ids
+        savedTrackIds = Self.deduplicated(ids)
     }
 
     /// Append saved track IDs for Favorites pagination
     func appendSavedTrackIds(_ ids: [String]) {
-        savedTrackIds.append(contentsOf: ids)
+        savedTrackIds = Self.deduplicated(savedTrackIds + ids)
+    }
+
+    /// Relinking is **many-to-one**: several saved recordings can share one market id, which is
+    /// the id the app keys tracks by (`AGENTS.md`, "Track identity is the market id"). So a
+    /// library page can name the same track twice, and two pages can each name it once.
+    ///
+    /// One row per track is not cosmetic here. `favoriteTracks` feeds a SwiftUI `ForEach` keyed
+    /// by `Track.id`, and duplicate ids there are undefined behaviour rather than a duplicate
+    /// row. Deduplicating across the whole list rather than per page is what makes the second
+    /// case work.
+    ///
+    /// A knock-on worth knowing: the list can be shorter than the `total` Spotify reports,
+    /// because that counts saved entries and this counts tracks. Pagination is unaffected —
+    /// offsets are Spotify's side of the conversation.
+    private static func deduplicated(_ ids: [String]) -> [String] {
+        var seen = Set<String>()
+        return ids.filter { seen.insert($0).inserted }
     }
 
     // MARK: - Favorite Actions
@@ -510,16 +515,27 @@ final class AppStore {
     }
 
     /// Mark fetched Favorites-section tracks as favorited without changing list order.
+    ///
+    /// Tolerates a repeated id rather than trapping on one: a library page can name the same
+    /// market recording twice, for the reason `deduplicated` explains. The status is the same
+    /// `true` either way, so collapsing them loses nothing.
     func markTracksAsFavorite(_ trackIds: [String]) {
-        let statuses = Dictionary(uniqueKeysWithValues: trackIds.map { ($0, true) })
+        let statuses = Dictionary(trackIds.map { ($0, true) }, uniquingKeysWith: { first, _ in first })
         updateFavoriteStatuses(statuses)
     }
 
     // MARK: - Playlist Actions
 
-    /// Add track to playlist
+    /// Add a track to a playlist optimistically.
+    ///
+    /// The uid is Spotify's to assign, and the response does not carry it, so the row is placed
+    /// under a locally generated one. It is replaced by the real uid at the next load — until
+    /// then the row renders and can be reordered, but removing it needs the reload, which is why
+    /// `PlaylistService` refreshes after an add.
     func addTrackToPlaylist(_ trackId: String, playlistId: String) {
-        playlists[playlistId]?.trackIds.append(trackId)
+        playlists[playlistId]?.items.append(
+            PlaylistItem(uid: "local:\(UUID().uuidString)", trackId: trackId),
+        )
         // Recalculate duration if we have the track
         if let track = tracks[trackId] {
             let currentDuration = playlists[playlistId]?.totalDurationMs ?? 0
@@ -527,24 +543,32 @@ final class AppStore {
         }
     }
 
-    /// Remove track from playlist
-    func removeTrackFromPlaylist(_ trackId: String, playlistId: String) {
-        if let track = tracks[trackId], let currentDuration = playlists[playlistId]?.totalDurationMs {
+    /// Remove **one occurrence** from a playlist, named by its uid.
+    ///
+    /// By uid rather than by track id: a playlist may hold the same song more than once, and
+    /// removing "the track" would take every copy — which is what the Web API path did.
+    func removePlaylistItem(uid: String, playlistId: String) {
+        guard let index = playlists[playlistId]?.items.firstIndex(where: { $0.uid == uid }) else {
+            return
+        }
+
+        let trackId = playlists[playlistId]?.items[index].trackId
+        if let trackId, let track = tracks[trackId], let currentDuration = playlists[playlistId]?.totalDurationMs {
             playlists[playlistId]?.totalDurationMs = max(0, currentDuration - track.durationMs)
         }
-        playlists[playlistId]?.trackIds.removeAll { $0 == trackId }
+        playlists[playlistId]?.items.remove(at: index)
     }
 
-    /// Move track within playlist (reorder)
+    /// Move an item within a playlist (reorder)
     func movePlaylistTrack(playlistId: String, fromIndex: Int, toIndex: Int) {
-        guard var trackIds = playlists[playlistId]?.trackIds,
-              fromIndex >= 0, fromIndex < trackIds.count,
-              toIndex >= 0, toIndex < trackIds.count,
+        guard var items = playlists[playlistId]?.items,
+              fromIndex >= 0, fromIndex < items.count,
+              toIndex >= 0, toIndex < items.count,
               fromIndex != toIndex
         else { return }
 
-        trackIds.move(fromOffsets: IndexSet(integer: fromIndex), toOffset: toIndex > fromIndex ? toIndex + 1 : toIndex)
-        playlists[playlistId]?.trackIds = trackIds
+        items.move(fromOffsets: IndexSet(integer: fromIndex), toOffset: toIndex > fromIndex ? toIndex + 1 : toIndex)
+        playlists[playlistId]?.items = items
     }
 
     /// Update playlist details
@@ -635,14 +659,15 @@ final class AppStore {
         searchErrorMessage = nil
     }
 
-    // MARK: - Recently Played Actions
+    // MARK: - Start Page Actions
 
-    func setRecentTrackIds(_ ids: [String]) {
-        recentTrackIds = ids
-    }
-
-    func setRecentItemURIs(_ uris: [String]) {
-        recentItemURIs = uris
+    /// Replaces the whole page. Shelves are not merged across loads: Spotify rebuilds this list
+    /// on every request — 31 sections in the same account differed in order and membership
+    /// between two requests three minutes apart — so keeping an old shelf that no longer came
+    /// back would show something Spotify has stopped recommending.
+    func setHomePage(sections: [HomeSection], greeting: String?) {
+        homeSections = sections
+        homeGreeting = greeting
     }
 
     // MARK: - Live State Freshness
@@ -759,13 +784,7 @@ final class AppStore {
                 let searchResultQueries: [String]
                 let lastDisplayedSearchQuery: String?
 
-                let recentTrackIds: [String]
-                let recentItemURIs: [String]
-
-                let topArtistIds: [String]
-                let topArtistsPagination: PaginationState
-                let topTrackAlbumIds: [String]
-                let topTrackAlbumsPagination: PaginationState
+                let homeSections: [HomeSection]
 
                 let queue: QueueSnapshot
 
@@ -806,12 +825,7 @@ final class AppStore {
                 searchResultsByQuery: searchResultsByQuery,
                 searchResultQueries: searchResultQueries,
                 lastDisplayedSearchQuery: lastDisplayedSearchQuery,
-                recentTrackIds: recentTrackIds,
-                recentItemURIs: recentItemURIs,
-                topArtistIds: topArtistIds,
-                topArtistsPagination: topArtistsPagination,
-                topTrackAlbumIds: topTrackAlbumIds,
-                topTrackAlbumsPagination: topTrackAlbumsPagination,
+                homeSections: homeSections,
                 queue: StoreSnapshot.QueueSnapshot(
                     previousTracks: queue.previousTracks.map { StoreSnapshot.QueueItemSnapshot(trackId: $0.trackId, provider: $0.provider.rawValue) },
                     currentTrack: queue.currentTrack.map { StoreSnapshot.QueueItemSnapshot(trackId: $0.trackId, provider: $0.provider.rawValue) },

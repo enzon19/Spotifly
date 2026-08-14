@@ -8,13 +8,11 @@
 import SwiftUI
 
 struct LoggedInView: View {
-    let authResult: SpotifyAuthResult
     let onLogout: () -> Void
 
     @Environment(WindowState.self) private var windowState
     @Environment(AuthViewModel.self) private var authViewModel
 
-    @State private var session: SpotifySession
     private let playbackViewModel = PlaybackViewModel.shared
 
     /// Normalized state store.
@@ -32,48 +30,32 @@ struct LoggedInView: View {
     /// Persisted because they store in-flight load tasks for dedup and
     /// cancellation-resilience across view recreation.
     @State private var trackService: TrackService
-    @State private var recentlyPlayedService: RecentlyPlayedService
-    @State private var topItemsService: TopItemsService
+    @State private var homeService: HomeService
 
     /// Services whose state lives entirely in AppStore.
     private var searchService: SearchService {
         SearchService(store: store)
     }
 
-    init(authResult: SpotifyAuthResult, onLogout: @escaping () -> Void) {
-        self.authResult = authResult
+    init(onLogout: @escaping () -> Void) {
         self.onLogout = onLogout
 
         let store = AppStore()
-        let session = SpotifySession(authResult: authResult)
-        // Captures the session, not a token, so every call gets a fresh one.
-        let tokenProvider: () async -> String = { await session.validAccessToken() }
 
         _store = State(initialValue: store)
-        _session = State(initialValue: session)
-        _playlistService = State(initialValue: PlaylistService(store: store, tokenProvider: tokenProvider))
-        _albumService = State(initialValue: AlbumService(store: store, tokenProvider: tokenProvider))
-        _artistService = State(initialValue: ArtistService(store: store, tokenProvider: tokenProvider))
-        let trackService = TrackService(store: store, tokenProvider: tokenProvider)
-        _queueService = State(initialValue: QueueService(store: store, tokenProvider: tokenProvider, trackService: trackService))
+        _playlistService = State(initialValue: PlaylistService(store: store))
+        _albumService = State(initialValue: AlbumService(store: store))
+        _artistService = State(initialValue: ArtistService(store: store))
+        let trackService = TrackService(store: store)
+        _queueService = State(initialValue: QueueService(store: store, trackService: trackService))
         _connectionService = State(initialValue: ConnectionService(store: store))
         _deviceService = State(initialValue: DeviceService(store: store))
         _navigationCoordinator = State(initialValue: NavigationCoordinator(store: store))
         _trackService = State(initialValue: trackService)
-        _recentlyPlayedService = State(initialValue: RecentlyPlayedService(store: store))
-        _topItemsService = State(initialValue: TopItemsService(store: store))
+        _homeService = State(initialValue: HomeService(store: store))
     }
-
-    @AppStorage("topItemsTimeRange") private var topItemsTimeRange: String = TopItemsTimeRange.mediumTerm.rawValue
 
     @State private var searchText = ""
-
-    enum BlockingState {
-        case premiumRequired
-        case userNotWhitelisted
-    }
-
-    @State private var blockingState: BlockingState?
 
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
@@ -94,37 +76,7 @@ struct LoggedInView: View {
     }
 
     var body: some View {
-        content
-            // When the refresh token is rejected (revoked, or expired after six
-            // months per Spotify's July 2026 policy) the session invalidates
-            // itself; tear down and return the user to the sign-in flow.
-            .onChange(of: session.isInvalidated) { _, invalidated in
-                if invalidated {
-                    onLogout()
-                }
-            }
-    }
-
-    @ViewBuilder
-    private var content: some View {
-        switch blockingState {
-        case .premiumRequired:
-            PremiumRequiredView(
-                displayName: store.userProfile?.displayName,
-                onLogout: onLogout,
-            )
-            .frame(minWidth: 500, minHeight: 400)
-
-        case .userNotWhitelisted:
-            UserNotWhitelistedView(
-                clientId: SpotifyConfig.getClientId(),
-                onLogout: onLogout,
-            )
-            .frame(minWidth: 500, minHeight: 400)
-
-        case nil:
-            mainAppView
-        }
+        mainAppView
     }
 
     private var mainAppView: some View {
@@ -162,13 +114,11 @@ struct LoggedInView: View {
         }
         .background(windowState.isMiniPlayerMode ? Color(NSColor.windowBackgroundColor) : Color.clear)
         .searchShortcuts()
-        .environment(session)
         .environment(connectionService)
         .environment(deviceService)
         .environment(queueService)
-        .environment(recentlyPlayedService)
+        .environment(homeService)
         .environment(searchService)
-        .environment(topItemsService)
         .environment(navigationCoordinator)
         .environment(store)
         .environment(trackService)
@@ -176,19 +126,14 @@ struct LoggedInView: View {
         .environment(albumService)
         .environment(artistService)
         .focusedValue(\.navigationSelection, navigationSelectionBinding)
-        .focusedValue(\.session, session)
-        .focusedValue(\.recentlyPlayedService, recentlyPlayedService)
+        .focusedValue(\.homeService, homeService)
         .loggedInLifecycle(
-            session: session,
             store: store,
-            topItemsTimeRange: topItemsTimeRange,
             playbackViewModel: playbackViewModel,
             queueService: queueService,
             deviceService: deviceService,
             connectionService: connectionService,
-            recentlyPlayedService: recentlyPlayedService,
-            topItemsService: topItemsService,
-            blockingState: $blockingState,
+            homeService: homeService,
         )
         .onChange(of: store.searchCacheEvictionRevision) {
             navigationCoordinator.invalidateUnviewableRoutes()
@@ -240,7 +185,9 @@ struct LoggedInView: View {
             isPresented: Bindable(playbackViewModel).needsStreamingAuthorization,
         ) {
             Button("playback.needs_authorization_authorize") {
-                Task { await authViewModel.authorizeStreaming(expectedAccountId: store.userId) }
+                // Through the view model, so the grant this starts can be cancelled from
+                // Speakers — the alert is gone by the time the browser answers.
+                authViewModel.startStreamingAuthorization(expectedAccountId: store.userId)
             }
             Button("common.cancel", role: .cancel) {}
         } message: {
@@ -290,9 +237,8 @@ struct LoggedInView: View {
     private func performSearch() {
         let query = searchText
         Task {
-            let token = await session.validAccessToken()
             debugLog("Search", "Starting search for: \(query)")
-            await searchService.search(accessToken: token, query: query)
+            await searchService.search(query: query)
             let hasResults = store.searchResults(for: query) != nil
             debugLog("Search", "After search - results: \(hasResults), error: \(store.searchErrorMessage ?? "nil")")
             // The field can be cleared while the request is in flight, which already left
@@ -313,8 +259,6 @@ struct LoggedInView: View {
     }
 
     private func refreshCurrentSection() async {
-        let token = await session.validAccessToken()
-
         switch navigationCoordinator.selectedNavigationItem {
         case .playlists:
             let previousSelection = navigationCoordinator.selectedPlaylistId
@@ -352,7 +296,8 @@ struct LoggedInView: View {
             try? await trackService.loadFavorites(forceRefresh: true)
 
         case .speakers:
-            await deviceService.loadDevices(accessToken: token)
+            // Nothing to refresh: the device list is pushed from the cluster.
+            break
 
         default:
             break

@@ -80,7 +80,6 @@ private struct NavigationHistoryToolbarControl: View {
 }
 
 private struct LoggedInContextToolbarActions: View {
-    @Environment(SpotifySession.self) private var session
     @Environment(AppStore.self) private var store
     @Environment(PlaylistService.self) private var playlistService
     @Environment(AlbumService.self) private var albumService
@@ -120,8 +119,7 @@ private struct LoggedInContextToolbarActions: View {
         return HStack(spacing: 8) {
             Button {
                 Task {
-                    let token = await session.validAccessToken()
-                    await playbackViewModel.addToQueue(uri: album.uri, accessToken: token)
+                    await playbackViewModel.addToQueue(uri: album.uri)
                 }
             } label: {
                 Label("track.menu.play_next", systemImage: "text.line.first.and.arrowtriangle.forward")
@@ -152,8 +150,7 @@ private struct LoggedInContextToolbarActions: View {
             } else {
                 Button {
                     Task {
-                        let token = await session.validAccessToken()
-                        try? await albumService.saveAlbumToLibrary(albumId: album.id, accessToken: token)
+                        try? await albumService.saveAlbumToLibrary(albumId: album.id)
                     }
                 } label: {
                     Label("album.menu.add_to_library", systemImage: "plus.circle")
@@ -181,8 +178,7 @@ private struct LoggedInContextToolbarActions: View {
             } else {
                 Button {
                     Task {
-                        let token = await session.validAccessToken()
-                        try? await artistService.followArtist(artistId: artist.id, accessToken: token)
+                        try? await artistService.followArtist(artistId: artist.id)
                     }
                 } label: {
                     Label("artist.menu.follow", systemImage: "person.badge.plus")
@@ -200,8 +196,7 @@ private struct LoggedInContextToolbarActions: View {
         return HStack(spacing: 8) {
             Button {
                 Task {
-                    let token = await session.validAccessToken()
-                    await playbackViewModel.addToQueue(uri: playlist.uri, accessToken: token)
+                    await playbackViewModel.addToQueue(uri: playlist.uri)
                 }
             } label: {
                 Label("track.menu.play_next", systemImage: "text.line.first.and.arrowtriangle.forward")
@@ -238,8 +233,7 @@ private struct LoggedInContextToolbarActions: View {
             } else {
                 Button {
                     Task {
-                        let token = await session.validAccessToken()
-                        try? await playlistService.followPlaylist(playlistId: playlist.id, accessToken: token)
+                        try? await playlistService.followPlaylist(playlistId: playlist.id)
                     }
                 } label: {
                     Label("playlist.menu.follow", systemImage: "plus.circle")

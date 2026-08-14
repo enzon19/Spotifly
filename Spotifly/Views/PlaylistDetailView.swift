@@ -12,7 +12,6 @@ struct PlaylistDetailView: View {
     let playlistId: String
 
     @Bindable var playbackViewModel: PlaybackViewModel
-    @Environment(SpotifySession.self) private var session
     @Environment(AppStore.self) private var store
     @Environment(TrackService.self) private var trackService
     @Environment(PlaylistService.self) private var playlistService
@@ -28,7 +27,7 @@ struct PlaylistDetailView: View {
     @State private var editingPlaylistDescription = ""
 
     // Drag-drop state
-    @State private var draggedTrackId: String?
+    @State private var draggedUid: String?
     @State private var draggedFromIndex: Int?
 
     /// The playlist from the store — the only copy. Whatever a load puts there
@@ -47,7 +46,18 @@ struct PlaylistDetailView: View {
 
     /// Tracks from the store for this playlist
     private var tracks: [Track] {
-        playlist?.trackIds.compactMap { store.tracks[$0] } ?? []
+        rows.map(\.track)
+    }
+
+    /// The playlist's entries paired with their tracks.
+    ///
+    /// Rows carry their `PlaylistItem`, not just a track, because reordering and removal name
+    /// the **occurrence**: a playlist can hold one song twice, and a row that knows only its
+    /// track cannot say which of the two it is.
+    private var rows: [(item: PlaylistItem, track: Track)] {
+        (playlist?.items ?? []).compactMap { item in
+            store.tracks[item.trackId].map { (item, $0) }
+        }
     }
 
     /// Whether the current user owns this playlist
@@ -250,8 +260,8 @@ struct PlaylistDetailView: View {
 
     private var normalTrackList: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ForEach(tracks.enumerated(), id: \.offset) { index, track in
-                trackRowView(track: track, index: index)
+            ForEach(rows.enumerated(), id: \.offset) { index, row in
+                trackRowView(item: row.item, track: row.track, index: index)
 
                 if index < tracks.count - 1 {
                     Divider()
@@ -266,7 +276,7 @@ struct PlaylistDetailView: View {
     }
 
     @ViewBuilder
-    private func trackRowView(track: Track, index: Int) -> some View {
+    private func trackRowView(item: PlaylistItem, track: Track, index: Int) -> some View {
         let row = TrackRow(
             track: track,
             index: index,
@@ -274,39 +284,37 @@ struct PlaylistDetailView: View {
             playbackViewModel: playbackViewModel,
             currentSection: .playlists,
             selectionId: playlistId,
+            itemUid: item.uid,
             onDoubleTap: {
                 guard let uri = playlist?.uri else { return }
-                let token = await session.validAccessToken()
                 await playbackViewModel.play(
                     uriOrUrl: uri,
                     trackIndex: index,
-                    accessToken: token,
                 )
             },
         )
 
         if isOwner {
             row
-                .opacity(draggedTrackId == track.id ? 0.5 : 1.0)
+                .opacity(draggedUid == item.uid ? 0.5 : 1.0)
                 .onDrag {
-                    draggedTrackId = track.id
-                    // Capture original index BEFORE any optimistic updates
-                    if let playlist = store.playlists[playlistId] {
-                        draggedFromIndex = playlist.trackIds.firstIndex(of: track.id)
-                    }
-                    return NSItemProvider(object: track.id as NSString)
+                    draggedUid = item.uid
+                    // Only to tell a real move from a drop in the same place; the move itself
+                    // is expressed entirely in uids.
+                    draggedFromIndex = store.playlists[playlistId]?.items
+                        .firstIndex { $0.uid == item.uid }
+                    return NSItemProvider(object: item.uid as NSString)
                 }
                 .onDrop(
                     of: [.text],
                     delegate: PlaylistReorderDropDelegate(
-                        targetTrackId: track.id,
+                        targetUid: item.uid,
                         playlistId: playlistId,
-                        draggedTrackId: $draggedTrackId,
+                        draggedUid: $draggedUid,
                         draggedFromIndex: $draggedFromIndex,
                         errorMessage: $errorMessage,
                         store: store,
                         playlistService: playlistService,
-                        session: session,
                     ),
                 )
         } else {
@@ -317,11 +325,7 @@ struct PlaylistDetailView: View {
     private func deletePlaylist() {
         Task {
             do {
-                let token = await session.validAccessToken()
-                try await playlistService.deletePlaylist(
-                    playlistId: playlistId,
-                    accessToken: token,
-                )
+                try await playlistService.deletePlaylist(playlistId: playlistId)
                 // Navigate away from the deleted playlist
                 navigationCoordinator.clearPlaylistSelection()
             } catch {
@@ -333,12 +337,7 @@ struct PlaylistDetailView: View {
     private func unfollowPlaylist() {
         Task {
             do {
-                let token = await session.validAccessToken()
-                // Uses the same API endpoint as delete - it's "unfollow" for both
-                try await playlistService.deletePlaylist(
-                    playlistId: playlistId,
-                    accessToken: token,
-                )
+                try await playlistService.unfollowPlaylist(playlistId: playlistId)
                 // Navigate away from the unfollowed playlist
                 navigationCoordinator.clearPlaylistSelection()
             } catch {
@@ -353,12 +352,10 @@ struct PlaylistDetailView: View {
 
         Task {
             do {
-                let token = await session.validAccessToken()
                 try await playlistService.updatePlaylistDetails(
                     playlistId: playlistId,
                     name: trimmedName,
                     description: editingPlaylistDescription,
-                    accessToken: token,
                 )
             } catch {
                 errorMessage = String(localized: "error.update_playlist \(error.localizedDescription)")
@@ -415,10 +412,9 @@ struct PlaylistDetailView: View {
     private func playAllTracks() {
         guard let playlist else { return }
         Task {
-            let token = await session.validAccessToken()
             // Use playlist URI to load via Spirc.load(LoadRequest::from_context_uri())
             // This properly loads the playlist context instead of individual tracks
-            await playbackViewModel.play(uriOrUrl: playlist.uri, accessToken: token)
+            await playbackViewModel.play(uriOrUrl: playlist.uri)
         }
     }
 }
@@ -427,55 +423,50 @@ struct PlaylistDetailView: View {
 
 /// Drop delegate for reordering tracks in a playlist
 struct PlaylistReorderDropDelegate: DropDelegate {
-    let targetTrackId: String
+    let targetUid: String
     let playlistId: String
-    @Binding var draggedTrackId: String?
+    @Binding var draggedUid: String?
     @Binding var draggedFromIndex: Int?
     @Binding var errorMessage: String?
     let store: AppStore
     let playlistService: PlaylistService
-    let session: SpotifySession
 
+    /// Sends the move the user just made, expressed in uids.
+    ///
+    /// The optimistic reorder has already happened by now, so the store holds exactly the order
+    /// on screen — and the request is simply "put this item before whatever now follows it".
+    /// Reading the desired order out of the store rather than reconstructing it from drag
+    /// bookkeeping is what makes this correct: the previous version mixed frames, indexing the
+    /// *already reordered* array with an index captured *before* the reorder, and so named the
+    /// wrong item to move. It survived on the Web API only because that took positions, which
+    /// Spotify applied against the server's own order.
     func performDrop(info _: DropInfo) -> Bool {
-        guard draggedTrackId != nil else { return false }
-
-        // Use the ORIGINAL index captured when drag started (before optimistic updates)
-        guard let originalFromIndex = draggedFromIndex else {
-            draggedTrackId = nil
+        defer {
+            draggedUid = nil
             draggedFromIndex = nil
+        }
+
+        guard let movingUid = draggedUid,
+              let playlist = store.playlists[playlistId],
+              let newIndex = playlist.items.firstIndex(where: { $0.uid == movingUid })
+        else {
             return false
         }
 
-        // Get current track order to find where the target track ended up
-        guard let playlist = store.playlists[playlistId] else {
-            draggedTrackId = nil
-            draggedFromIndex = nil
-            return false
-        }
+        // Dropped where it started: the frames agree, so there is nothing to send.
+        guard newIndex != draggedFromIndex else { return true }
 
-        // Find the current index of the target track (this is the drop position)
-        guard let currentToIndex = playlist.trackIds.firstIndex(of: targetTrackId) else {
-            draggedTrackId = nil
-            draggedFromIndex = nil
-            return true
-        }
+        let items = playlist.items
+        // Past the end is the bottom, which the service spells as its own move type rather
+        // than as a position.
+        let beforeUid = newIndex + 1 < items.count ? items[newIndex + 1].uid : nil
 
-        // Don't make API call if dropped in same position
-        guard originalFromIndex != currentToIndex else {
-            draggedTrackId = nil
-            draggedFromIndex = nil
-            return true
-        }
-
-        // Call the API with the ORIGINAL from index
-        Task {
-            let token = await session.validAccessToken()
+        Task { [movingUid, beforeUid] in
             do {
-                try await playlistService.reorderPlaylistTracks(
+                try await playlistService.movePlaylistItem(
                     playlistId: playlistId,
-                    rangeStart: originalFromIndex,
-                    insertBefore: currentToIndex > originalFromIndex ? currentToIndex + 1 : currentToIndex,
-                    accessToken: token,
+                    uid: movingUid,
+                    beforeUid: beforeUid,
                 )
             } catch {
                 // A newer reorder cancelled this one's reconciliation. It owns the
@@ -495,20 +486,18 @@ struct PlaylistReorderDropDelegate: DropDelegate {
             }
         }
 
-        draggedTrackId = nil
-        draggedFromIndex = nil
         return true
     }
 
     func dropEntered(info _: DropInfo) {
-        guard let draggedId = draggedTrackId,
+        guard let movingUid = draggedUid,
               let playlist = store.playlists[playlistId]
         else { return }
 
-        let trackIds = playlist.trackIds
+        let items = playlist.items
 
-        guard let fromIndex = trackIds.firstIndex(of: draggedId),
-              let toIndex = trackIds.firstIndex(of: targetTrackId),
+        guard let fromIndex = items.firstIndex(where: { $0.uid == movingUid }),
+              let toIndex = items.firstIndex(where: { $0.uid == targetUid }),
               fromIndex != toIndex
         else { return }
 
@@ -527,6 +516,6 @@ struct PlaylistReorderDropDelegate: DropDelegate {
     }
 
     func dropExited(info _: DropInfo) {
-        // Keep draggedTrackId until performDrop
+        // Keep draggedUid until performDrop
     }
 }

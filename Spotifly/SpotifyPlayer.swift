@@ -69,6 +69,9 @@ nonisolated enum StreamingAuthResult: Equatable {
     /// A logout landed while the grant was in flight, and the credentials it wrote were
     /// removed again. Nothing went wrong, so this is reported as neither success nor error.
     case superseded
+    /// The user abandoned the flow — closed the browser tab, or pressed Cancel. Distinct from
+    /// `failed` because there is nothing to report: they asked for this.
+    case cancelled
 
     init(code: Int32) {
         switch code {
@@ -493,6 +496,37 @@ private nonisolated func handleActiveDeviceCallback(_ deviceIdPtr: UnsafePointer
     }
 }
 
+/// Registers the Connect device-list callback with Rust (fires when the list changes)
+private nonisolated func registerDevicesCallback() {
+    spotifly_register_devices_callback { jsonPtr in
+        handleDevicesCallback(jsonPtr)
+    }
+}
+
+/// C callback for the Connect device list from cluster updates.
+///
+/// Decoded here rather than in the service because the payload is JSON on the C boundary and
+/// this is where every other JSON callback is turned into a Swift value.
+private nonisolated func handleDevicesCallback(_ jsonPtr: UnsafePointer<CChar>?) {
+    guard let jsonPtr else { return }
+    let json = String(cString: jsonPtr)
+
+    guard let data = json.data(using: .utf8),
+          let codables = try? JSONDecoder().decode([DeviceCodable].self, from: data)
+    else {
+        debugLog("SpotifyPlayer", "could not decode device list: \(json.prefix(200))")
+        return
+    }
+
+    debugLog("SpotifyPlayer", "handleDevicesCallback: \(codables.count) device(s)")
+
+    // `toDevice()` is main-actor isolated, like every entity conversion here, so the mapping
+    // happens on the hop rather than on the C callback's thread.
+    Task { @MainActor in
+        devicesSubject.send(codables.compactMap { $0.toDevice() })
+    }
+}
+
 /// Registers the session client changed callback with Rust
 private nonisolated func registerSessionClientChangedCallback() {
     spotifly_register_session_client_changed_callback { jsonPtr in
@@ -583,6 +617,28 @@ private nonisolated func handleQueueCallback(_ jsonPtr: UnsafePointer<CChar>?) {
     Task { @MainActor in queueSubject.send(state) }
 }
 
+/// The last queue the Connect cluster described, or nil if no cluster update has arrived.
+///
+/// The push equivalent of `/me/player/queue`, for the recovery paths that need to ask rather
+/// than wait — chiefly a *provisional* `SetQueue`, which librespot emits before `fill_up` with
+/// no queue in it at all. Nil is meaningful and distinct from an empty queue: it means nothing
+/// has been heard yet, so a caller should try again rather than conclude nothing is playing.
+nonisolated func currentQueueSnapshot() -> QueueState? {
+    // Bridged as non-optional, so the null Rust returns for "no cluster update yet" has to be
+    // checked rather than unwrapped.
+    let pointer: UnsafeMutablePointer<CChar>? = spotifly_get_queue_snapshot()
+    guard let pointer else { return nil }
+    defer { spotifly_free_string(pointer) }
+
+    guard let json = decodeJSONObject(pointer, context: "currentQueueSnapshot") else { return nil }
+
+    return QueueState(
+        currentTrack: (json["track"] as? [String: Any]).flatMap { parseQueueItem(from: $0) },
+        nextTracks: (json["next_tracks"] as? [[String: Any]] ?? []).compactMap { parseQueueItem(from: $0) },
+        previousTracks: (json["prev_tracks"] as? [[String: Any]] ?? []).compactMap { parseQueueItem(from: $0) },
+    )
+}
+
 /// Errors that can occur during playback
 enum SpotifyPlayerError: Error, LocalizedError {
     case initializationFailed
@@ -613,11 +669,26 @@ private nonisolated(unsafe) let becameActiveSubject = PassthroughSubject<Void, N
 /// Global subject for active device ID changes (from cluster updates)
 private nonisolated(unsafe) let activeDeviceSubject = PassthroughSubject<String, Never>()
 
+/// The Connect device list, which arrives on cluster updates rather than being asked for.
+/// `CurrentValueSubject` so a Speakers view opened after the last update still gets one.
+private nonisolated(unsafe) let devicesSubject = CurrentValueSubject<[Device]?, Never>(nil)
+
+/// Serializes the player operations that must not overlap: building the session, and the
+/// three that load content into it.
+///
+/// It was declared in `SpotifyAuth.swift` as `SpotifyAuthActor` and used only here, which was
+/// never what it isolated — it kept these calls off the main actor and off each other's toes.
+/// Renamed rather than kept when the dashboard OAuth it was named after was deleted.
+@globalActor
+actor SpotifyPlayerActor {
+    static let shared = SpotifyPlayerActor()
+}
+
 /// Swift wrapper for the Rust librespot playback functionality
 enum SpotifyPlayer {
     /// Initializes the player with the given access token.
     /// Must be called before any playback operations.
-    @SpotifyAuthActor
+    @SpotifyPlayerActor
     static func initialize() async throws {
         // Register callbacks (via nonisolated helpers to avoid actor isolation issues)
         registerAudioDataCallback()
@@ -633,6 +704,7 @@ enum SpotifyPlayer {
         registerSessionClientChangedCallback()
         registerConnectionStateCallback()
         registerActiveDeviceCallback()
+        registerDevicesCallback()
 
         // Sync playback settings from UserDefaults before initializing
         syncSettingsFromUserDefaults()
@@ -708,6 +780,11 @@ enum SpotifyPlayer {
 
     /// Returns a publisher that emits the active device ID on every cluster update.
     /// Use this to track which Spotify Connect device is active without polling the Web API.
+    /// The Connect device list, pushed on cluster updates. Replaces `/me/player/devices`.
+    static var devices: AnyPublisher<[Device]?, Never> {
+        devicesSubject.eraseToAnyPublisher()
+    }
+
     static var activeDeviceChanged: AnyPublisher<String, Never> {
         activeDeviceSubject.eraseToAnyPublisher()
     }
@@ -799,7 +876,7 @@ enum SpotifyPlayer {
     /// - Parameters:
     ///   - uriOrUrl: Spotify URI or URL (e.g., "spotify:album:xxx")
     ///   - trackIndex: Track index to start at (-1 = from beginning, 0+ = specific track)
-    @SpotifyAuthActor
+    @SpotifyPlayerActor
     static func play(uriOrUrl: String, trackIndex: Int = -1) async throws {
         let result = await Task.detached {
             uriOrUrl.withCString { ptr in
@@ -813,7 +890,7 @@ enum SpotifyPlayer {
     }
 
     /// Plays a track by its Spotify track ID.
-    @SpotifyAuthActor
+    @SpotifyPlayerActor
     static func playTrack(trackId: String) async throws {
         let trackUri = "spotify:track:\(trackId)"
         try await play(uriOrUrl: trackUri)
@@ -821,7 +898,7 @@ enum SpotifyPlayer {
 
     /// Plays multiple tracks in sequence.
     /// - Parameter trackUris: Array of Spotify track URIs
-    @SpotifyAuthActor
+    @SpotifyPlayerActor
     static func playTracks(_ trackUris: [String]) async throws {
         guard !trackUris.isEmpty else {
             throw SpotifyPlayerError.playbackFailed
@@ -908,6 +985,20 @@ enum SpotifyPlayer {
             _ = spotifly_shutdown()
             spotifly_cleanup()
         }.value
+
+        // These three replay: they are `CurrentValueSubject`s so that a Speakers view opened
+        // after the last update still gets one. That is right within a session and wrong
+        // across a logout — the next account's services subscribe and are handed the previous
+        // account's devices, queue and playback state before anything of their own has
+        // arrived, which shows other people's device names and aims transfers at device ids
+        // that are not theirs.
+        //
+        // Emptied rather than left to be overwritten, because the overwrite is not guaranteed:
+        // if the new session never connects, the old values are all the new subscriber ever
+        // sees. Subscribers already treat nil as "nothing to say".
+        devicesSubject.send(nil)
+        queueSubject.send(nil)
+        playbackStateSubject.send(nil)
     }
 
     /// Disconnects from Spotify Connect without preventing future reconnection.
@@ -1036,29 +1127,50 @@ enum SpotifyPlayer {
 
     /// Runs the one-time streaming authorization.
     ///
-    /// Opens the browser, waits for the loopback callback, and lets librespot persist the
-    /// credentials every later init connects from. Blocks on a human, so it runs detached —
-    /// never on the main actor. There is no cancellation: the flow terminates on its own,
-    /// and the alert's Cancel declines before this is called at all.
+    /// Swift mints the token now — see `KeymasterAuth` — and hands it to librespot, which
+    /// connects once and persists the credentials every later init connects from. The token
+    /// is kept rather than discarded: the same one authorizes pathfinder and spclient, so it
+    /// is adopted into `KeymasterSession` before the connect rather than after, and survives
+    /// even if librespot's half fails.
+    ///
+    /// Blocks on a human, so it runs off the main actor, and it is cancellable for the same
+    /// reason: the browser wait unwinds on cancellation, and so does the token exchange behind
+    /// it. The connect that follows does not — it is detached, so that a grant already written
+    /// to the keychain finishes registering this Mac rather than being abandoned half done.
     static func authorizeStreaming() async -> StreamingAuthResult {
-        // `.utility`, not `.userInitiated`: this waits on a human finishing a browser flow,
-        // and librespot-oauth exchanges the code on a plain `std::thread` at default QoS
-        // while blocking on its result. A user-initiated caller parked on that lower-QoS
-        // worker is a priority inversion, which the runtime reports.
-        await Task.detached(priority: .utility) {
-            StreamingAuthResult(code: spotifly_authorize_streaming())
-        }.value
-    }
+        let tokens: KeymasterTokens
+        do {
+            tokens = try await KeymasterAuth.authorize()
+            try await KeymasterSession.shared.adopt(tokens)
+        } catch is CancellationError {
+            debugLog("SpotifyPlayer", "Streaming authorization cancelled")
+            return .cancelled
+        } catch let error as URLError where error.code == .cancelled {
+            // The same cancellation, reported differently. Only the browser wait answers with
+            // `CancellationError`; once the redirect has landed the flow is inside
+            // `URLSession`, which reports a cancelled task as a `URLError` of its own — and
+            // falling through to `.failed` there told the user their connection had failed
+            // when what happened is that they pressed Cancel.
+            debugLog("SpotifyPlayer", "Streaming authorization cancelled during token exchange")
+            return .cancelled
+        } catch {
+            debugLog("SpotifyPlayer", "Streaming authorization failed: \(error)")
+            return .failed
+        }
 
-    /// Whether a streaming grant has already been completed on this machine.
-    static func hasCachedStreamingCredentials() -> Bool {
-        spotifly_has_streaming_credentials() == 1
+        // `.utility`, not `.userInitiated`: the connect that follows runs on librespot's
+        // runtime, and a user-initiated caller parked on a lower-QoS worker is a priority
+        // inversion, which the runtime reports.
+        let accessToken = tokens.accessToken
+        return await Task.detached(priority: .utility) {
+            accessToken.withCString { StreamingAuthResult(code: spotifly_authorize_streaming($0)) }
+        }.value
     }
 
     /// The Spotify account id the last successful grant authenticated as.
     ///
-    /// The browser runs the grant with whatever account it is signed into, which need not
-    /// be the one the Web API half is using.
+    /// The browser runs the grant with whatever account it is signed into, which need not be
+    /// the one already signed in here.
     static func lastGrantAccountId() -> String? {
         guard let ptr = spotifly_last_grant_account() else { return nil }
         defer { spotifly_free_string(ptr) }
@@ -1067,7 +1179,13 @@ enum SpotifyPlayer {
 
     /// Removes the cached streaming credentials so the next launch cannot connect the
     /// account that just logged out.
+    ///
+    /// Clears both halves of the grant. librespot's AP credentials are a file in the app
+    /// container; the keymaster tokens are a keychain item Swift owns. Forgetting only the
+    /// first would leave a long-lived refresh token for the signed-out account behind, and it
+    /// is the half the partner API clients read.
     static func clearStreamingCredentials() async {
+        await KeymasterSession.shared.clear()
         await Task.detached(priority: .userInitiated) {
             spotifly_clear_streaming_credentials()
         }.value

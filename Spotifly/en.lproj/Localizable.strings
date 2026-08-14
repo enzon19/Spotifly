@@ -2,15 +2,10 @@
 "app.name" = "Spotifly";
 
 /* Authentication */
-"auth.connect.description" = "Connect your Spotify account to get started";
+"auth.connect.description" = "Connect your Spotify account to get started. This authorizes Spotifly in your browser and makes this Mac available as a Spotify Connect device.";
 "auth.connect.button" = "Connect with Spotify";
-"auth.authenticating" = "Authenticating...";
 "auth.loading" = "Loading...";
 "auth.logout" = "Logout";
-"auth.client_id_label" = "Spotify Client ID";
-"auth.client_id_placeholder" = "Enter your Client ID";
-"auth.client_id_help_link" = "How do I get a Client ID?";
-"auth.client_id_existing_app_note" = "You can use an existing Spotify app if you add the redirect URI de.rvdh.spotifly://callback";
 
 /* Navigation */
 "nav.startpage" = "Startpage";
@@ -76,7 +71,6 @@
 "loading.artists" = "Loading artists...";
 "loading.tracks" = "Loading tracks...";
 "loading.top_tracks" = "Loading top tracks...";
-"loading.recently_played" = "Loading recently played...";
 
 /* Error Messages */
 "error.load_favorites" = "Failed to load favorites";
@@ -84,10 +78,10 @@
 "error.load_albums" = "Failed to load albums";
 "error.load_artists" = "Failed to load artists";
 "error.load_queue" = "Failed to load queue";
-"error.load_recently_played" = "Failed to load recently played: %@";
 "error.remove_from_queue" = "Failed to remove track from queue";
 "error.reorder_queue" = "Failed to reorder queue";
 "error.clear_queue" = "Failed to clear queue";
+"error.no_playback_device" = "This Mac is not connected to Spotify, so it cannot start playback elsewhere";
 
 /* Empty States */
 "empty.select_item" = "Select an item from the sidebar";
@@ -118,18 +112,10 @@
 "queue.clear.confirm.message %lld" = "This will remove %lld upcoming tracks from the queue.";
 "queue.clear.confirm.action" = "Clear Queue";
 
-/* Startpage Sections */
-"startpage.top_artists" = "Your Top Artists";
-"startpage.top_artists.empty" = "Listen to more music to see your top artists";
-"startpage.new_releases" = "New Releases";
-"startpage.new_releases.empty" = "No new releases available";
-"startpage.top_albums" = "Your Top Albums";
-"startpage.top_albums.empty" = "Listen to more music to see your top albums";
-"startpage.empty" = "No sections enabled";
-"startpage.empty.description" = "Enable sections in Preferences → Startpage";
-
-/* Recently Played */
-"recently_played.content" = "Recently Played";
+/* Startpage */
+"startpage.empty" = "Nothing to show yet";
+"startpage.empty.description" = "Spotify builds this page from what you listen to.";
+"startpage.error" = "Could not load the startpage";
 
 /* Sections */
 "section.tracks" = "Tracks";
@@ -156,7 +142,6 @@
 "speakers.active" = "Active";
 "speakers.empty" = "No speakers found";
 "speakers.empty_hint" = "Open Spotify on another device to see it here";
-"speakers.error.failed_to_load" = "Failed to load speakers";
 "speakers.error.failed_to_transfer" = "Failed to transfer playback";
 "speakers.now_playing" = "Now Playing";
 "speakers.audio_output" = "AirPlay";
@@ -172,6 +157,10 @@
 "speakers.this_computer" = "This Computer";
 "speakers.this_computer.name" = "Spotifly";
 "speakers.this_computer.hint" = "Transfer playback here";
+
+/* Volume */
+"volume.device_controls_itself %@" = "%@ controls its own volume";
+
 
 /* Menu Commands */
 "menu.playback" = "Playback";
@@ -202,14 +191,6 @@
 "preferences.restart_note" = "Changes take effect when playback restarts.";
 "preferences.version %@ (%@)" = "Version %@ (%@)";
 "preferences.copyright %@" = "© %@ Ralph von der Heyden";
-
-/* Startpage Preferences */
-"preferences.startpage.sections" = "Sections";
-"preferences.startpage.none_enabled" = "The startpage will be empty. Enable at least one section to show content.";
-"preferences.top_items_time_range" = "Top Items Time Range";
-"preferences.time_range.short_term" = "Last 4 Weeks";
-"preferences.time_range.medium_term" = "Last 6 Months";
-"preferences.time_range.long_term" = "Last Year";
 
 /* Album Context Menu & Alerts */
 "album.menu.remove_from_library" = "Remove from Library";
@@ -270,35 +251,21 @@
 "error.unfollow_artist %@" = "Failed to unfollow artist: %@";
 "error.follow_artist %@" = "Failed to follow artist: %@";
 
-/* Premium Required */
-"premium.required.title" = "Spotify Premium Required";
-"premium.required.logged_in_as %@" = "Logged in as %@";
-"premium.required.message" = "Spotifly requires a Spotify Premium account. It uses Spotify Connect to stream music, which is only available with Premium.";
-
-/* User Not Whitelisted */
-"whitelist.title" = "User Not Registered";
-"whitelist.message" = "Your Spotify account is not registered for this app. Each user must be added to the allowlist in the Spotify Developer Dashboard.";
-"whitelist.steps" = "How to fix this";
-"whitelist.step1 %@" = "Only the owner of the app with Client ID %@ can add users.";
-"whitelist.open_dashboard" = "Open Spotify Developer Dashboard";
-"whitelist.step2" = "Ask the app owner to add your Spotify email address under \"User Management\".";
-
 /* Profile */
 "profile.logged_in_as %@" = "Logged in as %@";
+"profile.unavailable" = "Account details unavailable";
+"profile.unavailable.description" = "Sign out and back in to reconnect your Spotify account.";
 "profile.open_in_spotify" = "Open in Spotify";
 "profile.email" = "Email";
 "profile.country" = "Country";
 "profile.subscription" = "Subscription";
 "profile.followers" = "Followers";
 
-// Streaming authorization (step 2)
-"auth.enable_playback_label" = "Enable playback on this Mac";
-"auth.enable_playback_note" = "Spotifly needs a second authorization to play audio here. Spotify requires a different app identity for streaming than for browsing your library, so this is a separate step.";
-"auth.enable_playback_button" = "Enable playback";
-"auth.enable_playback_waiting" = "Waiting for your browser...";
-"auth.enable_playback_skip" = "Skip for now";
-"auth.enable_playback_failed" = "Could not enable playback. Please try again.";
+// The grant: signing in on the login screen, re-authorizing playback everywhere else
+"auth.connect_cancel" = "Waiting for your browser — cancel";
+"auth.connect_failed" = "Could not connect to Spotify. Please try again.";
 "speakers.enable_this_mac" = "Enable this Mac";
+"speakers.enable_this_mac_cancel" = "Cancel authorization";
 "playback.needs_authorization_title" = "Enable playback on this Mac?";
 "playback.needs_authorization_message" = "There is no device to play on. Authorize streaming to play here, or start playback on another device first.";
 "playback.needs_authorization_authorize" = "Authorize";

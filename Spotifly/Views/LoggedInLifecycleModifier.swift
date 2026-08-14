@@ -9,16 +9,12 @@ import AppKit
 import SwiftUI
 
 struct LoggedInLifecycleModifier: ViewModifier {
-    let session: SpotifySession
     let store: AppStore
-    let topItemsTimeRange: String
     let playbackViewModel: PlaybackViewModel
     let queueService: QueueService
     let deviceService: DeviceService
     let connectionService: ConnectionService
-    let recentlyPlayedService: RecentlyPlayedService
-    let topItemsService: TopItemsService
-    @Binding var blockingState: LoggedInView.BlockingState?
+    let homeService: HomeService
 
     /// Last observed connection readiness; nil until the first snapshot arrives.
     @State private var wasConnectionReady: Bool?
@@ -45,46 +41,17 @@ struct LoggedInLifecycleModifier: ViewModifier {
 
                 #if DEBUG
                     AppStore.current = store
-                    SpotifySession.current = session
                 #endif
 
-                let token = await session.validAccessToken()
-
-                do {
-                    let profile = try await SpotifyAPI.getCurrentUserProfile(accessToken: token)
-                    store.setUserProfile(profile)
-                } catch SpotifyAPIError.forbidden {
-                    blockingState = .userNotWhitelisted
-                    return
-                } catch {
-                    // Continue without profile if the request fails for a non-auth reason.
-                }
-
-                do {
-                    // The response is kept, not just checked. Without it the device table
-                    // stays empty until Speakers is opened, and `activeDeviceId` is derived
-                    // from that table — so a user who has not authorized local streaming
-                    // would be told nothing can play, while their phone is playing.
-                    let devices = try await SpotifyAPI.fetchAvailableDevices(accessToken: token)
-                    store.upsertDevices(devices.devices)
-                } catch SpotifyAPIError.forbidden {
-                    blockingState = .premiumRequired
-                    return
-                } catch {
-                    // Continue on transient failures and let playback surface any later errors.
-                }
-
-                let timeRange = TopItemsTimeRange(rawValue: topItemsTimeRange) ?? .mediumTerm
-                async let topArtists: () = topItemsService.loadTopArtists(accessToken: token, timeRange: timeRange)
-                async let topTracks: () = topItemsService.loadTopTracks(accessToken: token, timeRange: timeRange)
-                async let recentlyPlayed: () = recentlyPlayedService.loadRecentlyPlayed(accessToken: token)
-
-                _ = await (topArtists, topTracks, recentlyPlayed)
-
-                playbackViewModel.setTokenProvider { await session.validAccessToken() }
+                // The profile and the start page are independent requests on the same grant, so
+                // they run together. Neither blocks: an app that cannot say who you are is
+                // still an app that plays music.
+                async let profile: () = loadProfile()
+                async let home: () = homeService.loadHome()
+                _ = await (profile, home)
 
                 await playbackViewModel.initializeIfNeeded()
-                await queueService.fetchInitialPlaybackState(accessToken: token)
+                await queueService.fetchInitialPlaybackState()
             }
             // Connection handling is driven by the connection snapshot, not by the Connect
             // activation callbacks. Activation and connection are different facts: another
@@ -115,9 +82,8 @@ struct LoggedInLifecycleModifier: ViewModifier {
 
                 // Re-sync with whatever is playing now.
                 Task {
-                    let token = await session.validAccessToken()
                     await deviceService.waitForTransferSettling()
-                    await queueService.fetchInitialPlaybackState(accessToken: token)
+                    await queueService.fetchInitialPlaybackState()
                 }
             }
             .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.willSleepNotification)) { _ in
@@ -143,33 +109,40 @@ struct LoggedInLifecycleModifier: ViewModifier {
                 }
             }
     }
+
+    /// Who is logged in. Failure is swallowed, because nothing on this path should block on it:
+    /// an app that cannot say who you are is still an app that plays music.
+    ///
+    /// It is no longer only the settings screen that reads it, though — the playlist library
+    /// writes address the rootlist by username — so `PlaylistService.requireProfile` fetches it
+    /// itself when it is missing rather than trusting this one attempt.
+    private func loadProfile() async {
+        do {
+            let profile = try await PartnerAPI().profile()
+            store.setUserProfile(UserProfile(pathfinder: profile))
+        } catch {
+            debugLog("LoggedInLifecycle", "Profile unavailable: \(error.localizedDescription)")
+        }
+    }
 }
 
 extension View {
     func loggedInLifecycle(
-        session: SpotifySession,
         store: AppStore,
-        topItemsTimeRange: String,
         playbackViewModel: PlaybackViewModel,
         queueService: QueueService,
         deviceService: DeviceService,
         connectionService: ConnectionService,
-        recentlyPlayedService: RecentlyPlayedService,
-        topItemsService: TopItemsService,
-        blockingState: Binding<LoggedInView.BlockingState?>,
+        homeService: HomeService,
     ) -> some View {
         modifier(
             LoggedInLifecycleModifier(
-                session: session,
                 store: store,
-                topItemsTimeRange: topItemsTimeRange,
                 playbackViewModel: playbackViewModel,
                 queueService: queueService,
                 deviceService: deviceService,
                 connectionService: connectionService,
-                recentlyPlayedService: recentlyPlayedService,
-                topItemsService: topItemsService,
-                blockingState: blockingState,
+                homeService: homeService,
             ),
         )
     }

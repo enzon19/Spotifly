@@ -11,7 +11,7 @@ use librespot_playback::config::{AudioFormat, Bitrate, PlayerConfig};
 use librespot_playback::mixer::softmixer::SoftMixer;
 use librespot_playback::mixer::{Mixer, MixerConfig, NoOpVolume};
 use librespot_playback::player::{Player, PlayerEvent, QueueTrack};
-use librespot_protocol::connect::ClusterUpdate;
+use librespot_protocol::connect::{Cluster, ClusterUpdate, MemberType, PutStateRequest};
 use librespot_protocol::player::{PlayerState, ProvidedTrack};
 use log::debug;
 use once_cell::sync::Lazy;
@@ -80,6 +80,14 @@ static SET_QUEUE_CALLBACK: Lazy<Mutex<Option<extern "C" fn(*const c_char)>>> =
     Lazy::new(|| Mutex::new(None));
 static ACTIVE_DEVICE_CALLBACK: Lazy<Mutex<Option<extern "C" fn(*const c_char)>>> =
     Lazy::new(|| Mutex::new(None));
+static DEVICES_CALLBACK: Lazy<Mutex<Option<extern "C" fn(*const c_char)>>> =
+    Lazy::new(|| Mutex::new(None));
+/// The last device list sent to Swift, so an unchanged cluster update stays silent. Cluster
+/// updates arrive for every playback tick, and the device list changes far more rarely.
+static LAST_DEVICES_JSON: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
+/// The last queue the cluster described, so Swift can ask again rather than re-deriving it
+/// from the Web API. See `spotifly_get_queue_snapshot`.
+static LAST_QUEUE_JSON: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 static LAST_ACTIVE_DEVICE_ID: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 /// Serializes snapshot building so a revision always orders snapshots by the state they
 /// actually saw. Held only across the build, never across delivery into Swift.
@@ -468,6 +476,32 @@ struct ConnectionStateInfo {
     is_active_device: bool,
 }
 
+/// One Spotify Connect device, in the shape `Device` in Swift already holds.
+///
+/// The Web API's `/me/player/devices` is what this replaces, and the field names match its
+/// JSON rather than the protobuf's so the Swift decoder did not have to change: `is_active`
+/// is derived here by comparing against the cluster's active device rather than being a field
+/// of its own, because the protobuf has no such flag — the cluster names one active device and
+/// every `DeviceInfo` is otherwise identical.
+#[derive(Serialize)]
+struct ConnectDeviceInfo {
+    id: String,
+    name: String,
+    #[serde(rename = "type")]
+    device_type: String,
+    is_active: bool,
+    is_private_session: bool,
+    is_restricted: bool,
+    volume_percent: Option<i32>,
+    /// Whether the device refuses remote volume changes.
+    ///
+    /// An iPhone sets this: iOS does not let an app set system volume on another app's
+    /// behalf, so the command comes back `400 DEVICE_DOES_NOT_SUPPORT_COMMAND`. The cluster
+    /// says so up front, and forwarding it is what lets the slider grey out rather than fail
+    /// after the user has already dragged it.
+    disable_volume: bool,
+}
+
 #[derive(Serialize)]
 struct SessionClientInfo {
     client_id: String,
@@ -722,6 +756,16 @@ pub extern "C" fn spotifly_register_active_device_callback(callback: extern "C" 
     *ACTIVE_DEVICE_CALLBACK.lock().unwrap() = Some(callback);
 }
 
+/// Registers a callback to receive the Connect device list from cluster updates.
+///
+/// The payload is the JSON array `/me/player/devices` used to return, so Swift decodes it with
+/// the type it already had. It fires only when the list actually changes, not on every cluster
+/// tick.
+#[no_mangle]
+pub extern "C" fn spotifly_register_devices_callback(callback: extern "C" fn(*const c_char)) {
+    *DEVICES_CALLBACK.lock().unwrap() = Some(callback);
+}
+
 /// Registers a callback to receive connection state change notifications.
 /// Called whenever the connection state changes (connect, disconnect, error, etc.).
 /// The callback receives JSON with full connection state.
@@ -797,6 +841,77 @@ fn mark_disconnected(reason: &str) {
     notify_connection_state_change();
 }
 
+/// Sends the cluster's device list to Swift, skipping an update that says nothing new.
+///
+/// Volume is 0..=65535 on the wire and 0..=100 in the app, matching what
+/// `/me/player/devices` returned — the conversion belongs here rather than in Swift, so the
+/// entity keeps meaning one thing.
+fn notify_devices(
+    devices: &std::collections::HashMap<String, librespot_protocol::connect::DeviceInfo>,
+    active_device_id: &str,
+) {
+    let mut list: Vec<ConnectDeviceInfo> = devices
+        .iter()
+        .map(|(id, info)| ConnectDeviceInfo {
+            id: id.clone(),
+            name: info.name.clone(),
+            // `DeviceType` is an open enum on the wire, so an unknown value has no variant to
+            // name. `/me/player/devices` answered "Unknown" for the same case.
+            device_type: info
+                .device_type
+                .enum_value()
+                .map(|kind| format!("{kind:?}").to_uppercase())
+                .unwrap_or_else(|_| "UNKNOWN".to_string()),
+            is_active: !active_device_id.is_empty() && id == active_device_id,
+            is_private_session: info.is_private_session,
+            // The protobuf has no equivalent, and nothing in the app reads it for a
+            // connect device. False rather than a guess.
+            is_restricted: false,
+            volume_percent: Some(((info.volume as f64) / 65535.0 * 100.0).round() as i32),
+            // Absent capabilities mean "nothing declared", which is not the same as declaring
+            // volume disabled — so the default is false, and only an explicit true greys the
+            // slider out. `volume_steps` is the other field that bears on this and is
+            // deliberately left alone: it describes granularity, not permission.
+            disable_volume: info
+                .capabilities
+                .as_ref()
+                .map(|capabilities| capabilities.disable_volume)
+                .unwrap_or(false),
+        })
+        .collect();
+
+    // The protobuf map has no order, so without this the same devices would look like a new
+    // list on every update and the change check below would never fire.
+    list.sort_by(|a, b| a.id.cmp(&b.id));
+
+    debug!(
+        "notify_devices: cluster carried {} device(s), active={}",
+        list.len(),
+        active_device_id
+    );
+
+    let json = match serde_json::to_string(&list) {
+        Ok(json) => json,
+        Err(e) => {
+            debug!("Failed to serialize device list: {:?}", e);
+            return;
+        }
+    };
+
+    let mut last = LAST_DEVICES_JSON.lock().unwrap();
+    if *last == json {
+        return;
+    }
+    *last = json.clone();
+    drop(last);
+
+    if let Some(callback) = registered_callback(&DEVICES_CALLBACK) {
+        if let Ok(c_str) = CString::new(json) {
+            callback(c_str.as_ptr());
+        }
+    }
+}
+
 /// Sends the active device ID to the registered callback if it changed since the last update.
 /// Called on every cluster update — deduplicates so Swift only sees actual changes.
 ///
@@ -826,58 +941,9 @@ fn notify_connection_state_change() {
     }
 }
 
-/// Scopes requested for the streaming session, mirroring librespot's own list.
-///
-/// These are granted to librespot's client id and have nothing to do with the Web API scopes
-/// Swift requests with the user's dashboard client id — the two grants are independent.
-static STREAMING_SCOPES: &[&str] = &[
-    "app-remote-control",
-    "playlist-modify",
-    "playlist-modify-private",
-    "playlist-modify-public",
-    "playlist-read",
-    "playlist-read-collaborative",
-    "playlist-read-private",
-    "streaming",
-    "ugc-image-upload",
-    "user-follow-modify",
-    "user-follow-read",
-    "user-library-modify",
-    "user-library-read",
-    "user-modify",
-    "user-modify-playback-state",
-    "user-modify-private",
-    "user-personalized",
-    "user-read-birthdate",
-    "user-read-currently-playing",
-    "user-read-email",
-    "user-read-play-history",
-    "user-read-playback-position",
-    "user-read-playback-state",
-    "user-read-private",
-    "user-read-recently-played",
-    "user-top-read",
-];
-
 /// Whether the run that started at `started_generation` has been superseded.
 fn run_is_superseded(started_generation: u64, current_generation: u64) -> bool {
     started_generation != current_generation
-}
-
-/// Asks the OS for a free loopback port by binding port 0 and reading back the assignment.
-///
-/// Spotify accepts any loopback port for librespot's client id, so nothing has to be
-/// registered in advance. There is an unavoidable gap between releasing this and the OAuth
-/// listener binding it; losing that race fails the grant, and the user retries.
-fn pick_free_loopback_port() -> Result<u16, String> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| format!("Could not reserve a loopback port: {e}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| format!("Could not read the reserved port: {e}"))?
-        .port();
-    drop(listener);
-    Ok(port)
 }
 
 /// Where librespot persists the AP credentials produced by the streaming grant.
@@ -923,74 +989,38 @@ pub extern "C" fn spotifly_last_grant_account() -> *mut c_char {
     }
 }
 
-/// Whether a streaming grant has already been completed on this machine.
+/// Completes the one-time streaming authorization with a token Swift has already minted:
+/// connects once, and lets librespot persist the AP credentials every later init uses.
 ///
-/// This is what makes the local device's absence explainable: without credentials there is
-/// nothing to register with Spotify Connect, so Spotifly is genuinely not in the device list.
+/// Returns 0 on success, -1 on failure, -2 if the run was superseded.
+///
+/// Swift owns the OAuth flow itself — see `KeymasterAuth` and
+/// `plans/single-grant-partner-api.md`. The token has to exist there anyway, because the same
+/// one authorizes pathfinder and spclient, and a token minted here would have been dropped on
+/// the floor after this call. What stays here is what only librespot can do: the AP connect
+/// and the credential cache.
+///
+/// The token must be minted with Spotify's own desktop client id. One minted with the user's
+/// dashboard client id authenticates with the AP but is rejected by login5, which is what took
+/// playback down entirely; see `plans/streaming-auth-needs-a-first-party-client-id.md`.
 #[no_mangle]
-pub extern "C" fn spotifly_has_streaming_credentials() -> i32 {
-    let cached = Cache::new(Some(credentials_cache_dir()), None, None, None)
-        .ok()
-        .and_then(|cache| cache.credentials());
-
-    match cached {
-        Some(_) => 1,
-        None => 0,
-    }
-}
-
-/// Runs the one-time streaming authorization: opens the browser, waits for the loopback
-/// callback, exchanges the code, connects, and lets librespot persist the AP credentials.
-///
-/// Returns 0 on success, -1 on failure, -2 if the run was superseded. There is no in-flight
-/// cancellation: the alert's Cancel declines before this is ever called, and interrupting a
-/// listener parked in a blocking read would cost more machinery than it buys.
-///
-/// Blocks on a human, so Swift must never call this on the main thread.
-#[no_mangle]
-pub extern "C" fn spotifly_authorize_streaming() -> i32 {
+pub extern "C" fn spotifly_authorize_streaming(access_token: *const c_char) -> i32 {
     let started_generation = LOGOUT_GENERATION.load(Ordering::SeqCst);
 
-    let port = match pick_free_loopback_port() {
-        Ok(p) => p,
-        Err(e) => {
-            debug!("Streaming authorization error: {}", e);
+    let token = match unsafe { c_string_arg(access_token) } {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            debug!("Streaming authorization error: no access token");
             return -1;
         }
     };
-
-    // librespot's own client id, never the user's dashboard one: only a first-party id can
-    // obtain the client token that login5 requires.
-    let client_id = SessionConfig::default().client_id;
-    let client = match librespot_oauth::OAuthClientBuilder::new(
-        &client_id,
-        &format!("http://127.0.0.1:{}/login", port),
-        STREAMING_SCOPES.to_vec(),
-    )
-    .open_in_browser()
-    .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            debug!("Streaming authorization error: {}", e);
-            return -1;
-        }
-    };
-
-    let token = match client.get_access_token() {
-        Ok(t) => t,
-        Err(e) => {
-            debug!("Streaming authorization failed: {}", e);
-            return -1;
-        }
-    };
-    debug!("Streaming authorization: token obtained, connecting");
+    debug!("Streaming authorization: token received, connecting");
 
     // Connect once so librespot writes the AP credentials into the cache. Every init after
     // this connects from that cache with no token at all.
     let result = RUNTIME.block_on(async {
         let device_id = format!("spotifly_{}", std::process::id());
-        let (session, credentials) = create_session(&device_id, Some(&token.access_token))?;
+        let (session, credentials) = create_session(&device_id, Some(&token))?;
         session
             .connect(credentials, true)
             .await
@@ -1170,6 +1200,133 @@ fn spawn_session_health_check(generation: u64) {
     });
 }
 
+/// Asks for the cluster once, because subscribing to it is not enough to be told what it is.
+///
+/// **The dealer only pushes changes.** librespot registers its own device and receives the
+/// current cluster in the *HTTP response* to that PUT — which this app's separate dealer
+/// subscription never sees. Measured on 2026-08-13: registration completed at :04.702 and the
+/// first push arrived at :27.035, twenty-three seconds later, and only because a phone
+/// connected. With nothing else on the account, Speakers stayed empty indefinitely while a
+/// Connect-enabled stereo sat there reachable.
+///
+/// So this registers a **hidden member** — `can_be_player: false, hidden: true` — the way any
+/// pure controller does, and reads the cluster out of the reply. Hidden because this is not a
+/// second playback device: librespot already registered the real one under its own id, and
+/// re-PUTing that id with a partial state would disturb its registration rather than ask a
+/// question.
+fn spawn_initial_cluster_fetch(session: &Session, generation: u64) {
+    let session = session.clone();
+
+    RUNTIME.spawn(async move {
+        // The connection id is assigned over the dealer websocket, which is launched
+        // alongside the session rather than before it, so it can be a moment behind.
+        let mut connection_id = String::new();
+        for _ in 0..40 {
+            connection_id = session.connection_id();
+            if !connection_id.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+
+        if connection_id.is_empty() {
+            debug!("Initial cluster fetch: no connection id, giving up");
+            return;
+        }
+
+        if !listener_may_act(generation, SESSION_GENERATION.load(Ordering::SeqCst)) {
+            return;
+        }
+
+        match fetch_cluster(&session).await {
+            Ok(cluster) => {
+                // Again, after the request rather than only before it. A cluster describes an
+                // account, and a logout can land inside this call — `spotifly_cleanup` empties
+                // the snapshot caches, and applying this would fill them straight back up and
+                // publish the previous account's devices, queue and playback state to whoever
+                // signs in next. The check before the request cannot see that; only this one
+                // can.
+                if !listener_may_act(generation, SESSION_GENERATION.load(Ordering::SeqCst)) {
+                    debug!("Initial cluster fetch: superseded while in flight, discarding");
+                    return;
+                }
+
+                debug!(
+                    "Initial cluster fetch: {} device(s), active={}",
+                    cluster.device.len(),
+                    cluster.active_device_id
+                );
+                // Same handling a pushed update gets, so there is one path into Swift rather
+                // than two that can drift.
+                apply_cluster(cluster);
+            }
+            Err(e) => debug!("Initial cluster fetch failed: {}", e),
+        }
+    });
+}
+
+/// Registers a hidden connect-state member and returns the cluster the service answers with.
+async fn fetch_cluster(session: &Session) -> Result<Cluster, String> {
+    use protobuf::Message;
+
+    let mut request = PutStateRequest::new();
+    request.member_type = MemberType::CONNECT_STATE.into();
+
+    let device = request.device.mut_or_insert_default();
+    let info = device.device_info.mut_or_insert_default();
+    let capabilities = info.capabilities.mut_or_insert_default();
+    capabilities.can_be_player = false;
+    capabilities.hidden = true;
+    capabilities.needs_full_player_state = true;
+
+    // A member id of our own, distinct from the one librespot registered.
+    let endpoint = format!(
+        "/connect-state/v1/devices/hobs_{}",
+        session.device_id().chars().take(32).collect::<String>()
+    );
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "x-spotify-connection-id",
+        session
+            .connection_id()
+            .parse()
+            .map_err(|_| "connection id is not a valid header value".to_string())?,
+    );
+
+    let bytes = session
+        .spclient()
+        .request_with_protobuf(&http::Method::PUT, &endpoint, Some(headers), &request)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+
+    Cluster::parse_from_bytes(&bytes).map_err(|e| format!("could not parse cluster: {e:?}"))
+}
+
+/// Everything a cluster says, delivered to Swift. Shared by the push and the initial fetch,
+/// so what the app learns cannot depend on which of the two told it.
+///
+/// Our own activity is derived from the cluster rather than inferred from whichever command
+/// ran last. This is the same comparison `SpircTask` makes internally; Spotifly runs a second
+/// subscription to the same dealer topic and has to reach the same conclusion, or playback
+/// routing and the UI disagree.
+///
+/// The device list rides along and used to be dropped on the floor, so Swift asked
+/// `/me/player/devices` for what was already here.
+fn apply_cluster(cluster: Cluster) {
+    set_active_device(is_active_in_cluster(
+        &cluster.active_device_id,
+        current_device_id().as_deref(),
+    ));
+    notify_active_device_id(&cluster.active_device_id);
+    notify_devices(&cluster.device, &cluster.active_device_id);
+
+    if let Some(player_state) = cluster.player_state.into_option() {
+        send_playback_state(&player_state);
+        process_and_send_queue(player_state);
+    }
+}
+
 /// Subscribes to cluster updates on the session's dealer and spawns a task to process them.
 ///
 /// When the stream ends, the Spirc it belonged to is gone, so this triggers reconnection —
@@ -1198,20 +1355,7 @@ fn spawn_cluster_listener(session: &Session, generation: u64) -> Result<(), Stri
             match msg_result {
                 Ok(cluster_update) => {
                     if let Some(cluster) = cluster_update.cluster.into_option() {
-                        // Derive our own activity from the cluster rather than inferring it
-                        // from whichever command happened to run last. This is the same
-                        // comparison SpircTask makes internally; Spotifly runs a second
-                        // subscription to the same dealer topic and has to reach the same
-                        // conclusion, or playback routing and the UI disagree.
-                        set_active_device(is_active_in_cluster(
-                            &cluster.active_device_id,
-                            current_device_id().as_deref(),
-                        ));
-                        notify_active_device_id(&cluster.active_device_id);
-                        if let Some(player_state) = cluster.player_state.into_option() {
-                            send_playback_state(&player_state);
-                            process_and_send_queue(player_state);
-                        }
+                        apply_cluster(cluster);
                     }
                 }
                 Err(e) => {
@@ -1932,6 +2076,7 @@ async fn build_player_async(
     *PLAYER_EVENT_TX.lock().unwrap() = Some(tx);
 
     spawn_cluster_listener(&session, current_generation)?;
+    spawn_initial_cluster_fetch(&session, current_generation);
     spawn_session_health_check(current_generation);
 
     match create_and_store_spirc(&session, &credentials, player, mixer).await {
@@ -2325,14 +2470,38 @@ fn process_and_send_queue(player_state: PlayerState) {
         prev_tracks.len()
     );
 
-    send_json(
-        callback,
-        &QueueState {
-            track: current_track,
-            next_tracks,
-            prev_tracks,
-        },
-    );
+    let state = QueueState {
+        track: current_track,
+        next_tracks,
+        prev_tracks,
+    };
+
+    // Remembered as well as sent. A callback is a one-shot, and Swift has recovery paths that
+    // need to ask "what is playing?" at a moment of their own choosing — a provisional
+    // SetQueue from librespot being the awkward one, since it arrives carrying no queue at
+    // all. That question used to go to `/me/player/queue`; now it comes back here.
+    if let Ok(json) = serde_json::to_string(&state) {
+        *LAST_QUEUE_JSON.lock().unwrap() = Some(json);
+    }
+
+    send_json(callback, &state);
+}
+
+/// The last queue the cluster described, as JSON, or null if no cluster update has arrived.
+///
+/// Replaces `/me/player/queue` and `/me/player` for Swift's bootstrap. Deliberately a snapshot
+/// of what was already pushed rather than a fresh request: the cluster is the only source now,
+/// so there is nothing newer to fetch, and a caller that gets null has genuinely not been told
+/// anything yet rather than having been told there is nothing.
+#[no_mangle]
+pub extern "C" fn spotifly_get_queue_snapshot() -> *mut c_char {
+    let snapshot = LAST_QUEUE_JSON.lock().unwrap().clone();
+    match snapshot {
+        Some(json) => CString::new(json)
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        None => std::ptr::null_mut(),
+    }
 }
 
 /// Helper to ensure the device is active before loading content.
@@ -2886,6 +3055,15 @@ pub extern "C" fn spotifly_cleanup() {
     *CURRENT_CONTEXT_URI.lock().unwrap() = None;
     LAST_VOLUME.store(0, Ordering::SeqCst);
     LAST_ACTIVE_DEVICE_ID.lock().unwrap().clear();
+
+    // The cluster describes an account, so both of these belong to the session being torn
+    // down. `spotifly_get_queue_snapshot` is what the queue bootstrap reads on a cold start,
+    // and its whole guard rests on nil meaning "no cluster update has arrived" — a surviving
+    // snapshot makes that read as "this is the queue", and a freshly logged-in account gets
+    // the previous one's. The device list is a dedup cache, so a stale entry would suppress
+    // the first update after a login as unchanged.
+    *LAST_QUEUE_JSON.lock().unwrap() = None;
+    LAST_DEVICES_JSON.lock().unwrap().clear();
 
     // Reset the connection snapshot: not ready, not connected, no device ID.
     // reconnect_attempt is deliberately preserved - it drives exponential backoff and
@@ -3633,12 +3811,4 @@ mod tests {
         assert!(!dir.exists());
     }
 
-    #[test]
-    fn picks_a_bindable_loopback_port() {
-        let port = pick_free_loopback_port().expect("a free port");
-        assert!(port >= 1024, "must not need root: {port}");
-        // Proves it is actually bindable, which is what the OAuth listener does next.
-        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bindable");
-        drop(listener);
-    }
 }

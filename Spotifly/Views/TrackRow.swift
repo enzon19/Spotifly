@@ -9,6 +9,28 @@ import SwiftUI
 
 /// Reusable track row view
 struct TrackRow: View {
+    /// Whether this row is the one playing.
+    ///
+    /// **Position wins over uri where the list knows both.** A list can legitimately hold the
+    /// same recording twice — an album with a reprise, a playlist a track was added to twice,
+    /// or two catalogue entries that relink to one market id (see AGENTS.md, "Relinking is
+    /// many-to-one") — and matching on uri lights up every one of them. That drew two rows of
+    /// an eleven-track queue green while only one of them advanced.
+    ///
+    /// Only the queue passes `currentIndex`, because only the queue has a current *position*.
+    /// An album page or a search result has nothing better than the uri to go on.
+    static func isCurrent(
+        index: Int?,
+        currentIndex: Int?,
+        uri: String,
+        playingUri: String?,
+    ) -> Bool {
+        if let index, let currentIndex {
+            return index == currentIndex
+        }
+        return playingUri == uri
+    }
+
     let track: Track
     let showTrackNumber: Bool // Show track number instead of index
     let index: Int? // Optional index for queue
@@ -18,9 +40,15 @@ struct TrackRow: View {
     @Bindable var playbackViewModel: PlaybackViewModel
     let currentSection: NavigationItem // Current sidebar section (for "Go to" navigation)
     let selectionId: String? // Current selection ID (e.g., playlist ID) for back navigation
+    /// Which *occurrence* this row is, where the list knows — only a playlist does.
+    ///
+    /// `selectionId` names the list and `track` names the song, and between them they still do
+    /// not name a row: a playlist can hold the same song twice, and the two rows are equal on
+    /// both. The uid is the only thing that tells them apart, which is why removing from the
+    /// context menu needs it.
+    let itemUid: String?
     let onDoubleTap: (@MainActor () async -> Void)? // Playback action on double-tap
 
-    @Environment(SpotifySession.self) private var session
     @Environment(AppStore.self) private var store
     @Environment(TrackService.self) private var trackService
     @Environment(PlaylistService.self) private var playlistService
@@ -62,12 +90,18 @@ struct TrackRow: View {
         playbackViewModel: PlaybackViewModel,
         currentSection: NavigationItem = .startpage,
         selectionId: String? = nil,
+        itemUid: String? = nil,
         onDoubleTap: (@MainActor () async -> Void)? = nil,
     ) {
         self.track = track
         self.showTrackNumber = showTrackNumber
         self.index = index
-        isCurrentTrack = currentlyPlayingURI == track.uri
+        isCurrentTrack = Self.isCurrent(
+            index: index,
+            currentIndex: currentIndex,
+            uri: track.uri,
+            playingUri: currentlyPlayingURI,
+        )
         isPlayedTrack = if let index, let currentIndex {
             index < currentIndex
         } else {
@@ -77,6 +111,7 @@ struct TrackRow: View {
         self.playbackViewModel = playbackViewModel
         self.currentSection = currentSection
         self.selectionId = selectionId
+        self.itemUid = itemUid
         self.onDoubleTap = onDoubleTap
     }
 
@@ -180,6 +215,7 @@ struct TrackRow: View {
                     track: track,
                     currentSection: currentSection,
                     selectionId: selectionId,
+                    itemUid: itemUid,
                     playbackViewModel: playbackViewModel,
                     showNewPlaylistDialog: $showNewPlaylistDialog,
                     onPlaylistAdded: showSuccessFeedback,
@@ -207,6 +243,7 @@ struct TrackRow: View {
                 track: track,
                 currentSection: currentSection,
                 selectionId: selectionId,
+                itemUid: itemUid,
                 playbackViewModel: playbackViewModel,
                 showNewPlaylistDialog: $showNewPlaylistDialog,
                 onPlaylistAdded: showSuccessFeedback,
@@ -240,11 +277,7 @@ struct TrackRow: View {
             isTogglingFavorite = true
 
             do {
-                let token = await session.validAccessToken()
-                try await trackService.toggleFavorite(
-                    trackId: track.id,
-                    accessToken: token,
-                )
+                try await trackService.toggleFavorite(trackId: track.id)
             } catch {
                 // Error is handled by optimistic rollback in TrackService
                 playbackViewModel.errorMessage = "Failed to update favorite: \(error.localizedDescription)"
@@ -266,19 +299,13 @@ struct TrackRow: View {
         Task {
             isAddingToPlaylist = true
             do {
-                let token = await session.validAccessToken()
-
                 // Create the playlist using PlaylistService
-                let newPlaylist = try await playlistService.createPlaylist(
-                    name: trimmedName,
-                    accessToken: token,
-                )
+                let newPlaylist = try await playlistService.createPlaylist(name: trimmedName)
 
                 // Add the track to the new playlist
                 try await playlistService.addTracksToPlaylist(
                     playlistId: newPlaylist.id,
                     trackIds: [track.id],
-                    accessToken: token,
                 )
 
                 showSuccessFeedback()

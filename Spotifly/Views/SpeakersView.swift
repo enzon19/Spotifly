@@ -8,7 +8,6 @@
 import SwiftUI
 
 struct SpeakersView: View {
-    @Environment(SpotifySession.self) private var session
     @Environment(AppStore.self) private var store
     @Environment(DeviceService.self) private var deviceService
     @Environment(AuthViewModel.self) private var authViewModel
@@ -37,16 +36,6 @@ struct SpeakersView: View {
                 Spacer()
                 ProgressView()
                     .controlSize(.large)
-                Spacer()
-            } else if let errorMessage = store.devicesErrorMessage {
-                Spacer()
-                VStack(spacing: 12) {
-                    Image(systemName: "exclamationmark.triangle")
-                        .font(.system(size: 40))
-                        .foregroundStyle(.secondary)
-                    Text(errorMessage)
-                        .foregroundStyle(.secondary)
-                }
                 Spacer()
             } else {
                 List {
@@ -82,8 +71,16 @@ struct SpeakersView: View {
                         // file in place while every initialization fails, and keying on the
                         // file would hide the only way to recover from exactly that.
                         if !playbackViewModel.isLocalPlaybackAvailable {
+                            // Stays enabled while the grant waits, and cancels it instead of
+                            // starting a second one. A browser tab closed without authorizing
+                            // sends nothing at all, so without this the row spun until the
+                            // listener's timeout with no way back to it.
                             Button {
-                                Task { await authViewModel.authorizeStreaming(expectedAccountId: store.userId) }
+                                if authViewModel.isAuthorizingStreaming {
+                                    authViewModel.cancelStreamingAuthorization()
+                                } else {
+                                    authViewModel.startStreamingAuthorization(expectedAccountId: store.userId)
+                                }
                             } label: {
                                 HStack {
                                     if authViewModel.isAuthorizingStreaming {
@@ -94,12 +91,15 @@ struct SpeakersView: View {
                                         Image(systemName: "laptopcomputer.slash")
                                             .foregroundStyle(.secondary)
                                     }
-                                    Text("speakers.enable_this_mac")
+                                    Text(
+                                        authViewModel.isAuthorizingStreaming
+                                            ? "speakers.enable_this_mac_cancel"
+                                            : "speakers.enable_this_mac",
+                                    )
                                     Spacer()
                                 }
                             }
                             .buttonStyle(.plain)
-                            .disabled(authViewModel.isAuthorizingStreaming)
                         }
                     } header: {
                         Text("speakers.spotify_connect")
@@ -134,9 +134,9 @@ struct SpeakersView: View {
                     // Librespot Connection Status
                     Section {
                         ConnectionStatusView {
-                            let token = await session.validAccessToken()
+                            // Reconnecting re-registers our device, which changes the cluster
+                            // and pushes a fresh device list back on its own.
                             await playbackViewModel.forceReinitialize()
-                            await deviceService.loadDevices(accessToken: token)
                         }
                     } header: {
                         Text("speakers.librespot_connection")
@@ -148,23 +148,17 @@ struct SpeakersView: View {
                 }
             }
         }
-        .task {
-            let token = await session.validAccessToken()
-            await deviceService.loadDevices(accessToken: token)
-        }
     }
 }
 
 struct SpeakerRow: View {
     let device: Device
-    @Environment(SpotifySession.self) private var session
     @Environment(DeviceService.self) private var deviceService
 
     var body: some View {
         Button {
             Task {
-                let token = await session.validAccessToken()
-                _ = await deviceService.transferPlayback(to: device, accessToken: token)
+                _ = await deviceService.transferPlayback(to: device)
             }
         } label: {
             HStack(spacing: 12) {

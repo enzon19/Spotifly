@@ -11,15 +11,17 @@ import Testing
 
 @MainActor
 struct TrackServiceTests {
-    @Test func `cached metadata returns without fetching a token`() async throws {
+    /// The token half of this test is gone with the Web API: `TrackService` runs entirely on
+    /// the keymaster grant now, which `PartnerAPI` holds, so there is no token for a cache hit
+    /// to avoid taking. What it still guards is the part that matters — a track already in the
+    /// store costs no request.
+    @Test func `cached metadata returns without a request`() async throws {
         let store = AppStore()
         store.upsertTrack(Track(from: apiTrack(id: "cached")))
-        let tokens = RequestCounter()
         let requests = RequestRecorder()
         let service = TrackService(
             store: store,
-            tokenProvider: { tokens.count += 1; return "token" },
-            metadataFetcher: { _, trackIds in
+            metadataFetcher: { trackIds in
                 requests.trackIdBatches.append(trackIds)
                 return metadata(for: trackIds)
             },
@@ -27,7 +29,6 @@ struct TrackServiceTests {
 
         try await service.ensureTracksLoaded(trackIds: ["cached", "cached"])
 
-        #expect(tokens.count == 0)
         #expect(requests.trackIdBatches.isEmpty)
     }
 
@@ -37,8 +38,7 @@ struct TrackServiceTests {
         let requests = RequestRecorder()
         let service = TrackService(
             store: store,
-            tokenProvider: { "token" },
-            metadataFetcher: { _, trackIds in
+            metadataFetcher: { trackIds in
                 requests.trackIdBatches.append(trackIds)
                 if trackIds.contains("a") {
                     await gate.wait()
@@ -74,8 +74,7 @@ struct TrackServiceTests {
         let requests = RequestCounter()
         let service = TrackService(
             store: store,
-            tokenProvider: { "token" },
-            metadataFetcher: { _, trackIds in
+            metadataFetcher: { trackIds in
                 requests.count += 1
                 if requests.count == 1 {
                     throw TrackMetadataFailure()
@@ -98,8 +97,7 @@ struct TrackServiceTests {
         let requests = RequestCounter()
         let service = TrackService(
             store: store,
-            tokenProvider: { "token" },
-            metadataFetcher: { _, trackIds in
+            metadataFetcher: { trackIds in
                 requests.count += 1
                 // Spotify omits IDs that do not resolve for this market.
                 return metadata(for: trackIds.filter { $0 != "unavailable" })
@@ -119,8 +117,7 @@ struct TrackServiceTests {
         let requests = RequestCounter()
         let service = TrackService(
             store: store,
-            tokenProvider: { "token" },
-            metadataFetcher: { _, trackIds in
+            metadataFetcher: { trackIds in
                 requests.count += 1
                 if requests.count == 1 {
                     throw TrackMetadataFailure()
@@ -145,8 +142,7 @@ struct TrackServiceTests {
         let replacementFinished = RequestCounter()
         let service = TrackService(
             store: store,
-            tokenProvider: { "token" },
-            metadataFetcher: { _, trackIds in
+            metadataFetcher: { trackIds in
                 requests.count += 1
                 await gate.wait()
                 return metadata(for: trackIds)
@@ -181,8 +177,7 @@ struct TrackServiceTests {
         let replacementFinished = RequestCounter()
         let service = TrackService(
             store: store,
-            tokenProvider: { "token" },
-            favoriteStatusFetcher: { _, trackIds in
+            favoriteStatusFetcher: { trackIds in
                 requests.count += 1
                 await requestGate.wait()
                 try Task.checkCancellation()
@@ -250,8 +245,8 @@ private final class RequestGate {
 }
 
 @MainActor
-private func metadata(for trackIds: [String]) -> [String: APITrack] {
-    Dictionary(uniqueKeysWithValues: trackIds.map { ($0, apiTrack(id: $0)) })
+private func metadata(for trackIds: [String]) -> [String: Track] {
+    Dictionary(uniqueKeysWithValues: trackIds.map { ($0, Track(from: apiTrack(id: $0))) })
 }
 
 @MainActor
