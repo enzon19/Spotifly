@@ -708,7 +708,7 @@ final class PlaybackViewModel {
         }
 
         // Immediately reset position to 0 for responsive UI
-        anchorPosition(0)
+        anchorPosition(0, optimistic: true)
         updateNowPlayingInfo()
     }
 
@@ -733,13 +733,13 @@ final class PlaybackViewModel {
         }
 
         // Immediately reset position to 0 for responsive UI
-        anchorPosition(0)
+        anchorPosition(0, optimistic: true)
         updateNowPlayingInfo()
     }
 
     func seek(to positionMs: UInt32) {
         // Update anchor immediately for smooth UI feedback during scrubbing
-        anchorPosition(positionMs)
+        anchorPosition(positionMs, optimistic: true)
         updateNowPlayingPosition()
 
         // Debounce the actual seek operation to avoid flooding Spirc/API with requests
@@ -765,9 +765,9 @@ final class PlaybackViewModel {
         }
 
         // Don't call syncPositionAnchor() - Rust returns 0 immediately after resume.
-        // Re-anchor to the position we already hold, which is correct from the paused state:
-        // only the clock restarts.
-        anchorPosition(positionAnchorMs)
+        // The position we already hold is correct from the paused state: only the clock
+        // restarts.
+        restartPositionClock()
         updateNowPlayingPosition()
     }
 
@@ -1249,6 +1249,21 @@ final class PlaybackViewModel {
     private var positionAnchorTime: Double = CACurrentMediaTime()
     private var driftCorrectionTask: Task<Void, Never>?
 
+    /// How far the display may disagree with Rust before the disagreement means something.
+    private static let positionDisagreementMs: Int64 = 500
+
+    /// How long an optimistic anchor is given to be confirmed before it is treated as a
+    /// command that never happened. Long enough to cover the 150 ms seek debounce and the
+    /// round trip after it — measured at ~25 ms from `spotifly_seek` to the state callback
+    /// — and it restarts on each drag update, so a long scrub extends it rather than
+    /// outliving it.
+    private static let optimisticAnchorGrace: Double = 1.0
+
+    /// When the anchor was last written by a transport command rather than by a
+    /// measurement, and so is a promise about where playback is *going*. Cleared by the
+    /// next authoritative anchor, which is what "the command landed" looks like from here.
+    private var optimisticAnchorTime: Double?
+
     /// Re-anchors the displayed position: `positionMs` is where playback is, `time` is the
     /// moment it was there.
     ///
@@ -1259,9 +1274,30 @@ final class PlaybackViewModel {
     /// `time` defaults to now. A caller holding a snapshot that was true *earlier* — a
     /// Mercury or Web API state carrying a timestamp — passes that moment instead, so
     /// interpolation accounts for the delay rather than restarting the clock.
-    private func anchorPosition(_ positionMs: UInt32, at time: Double = CACurrentMediaTime()) {
+    ///
+    /// `optimistic` marks the anchors that transport commands write ahead of playback, to
+    /// keep scrubbing and skipping responsive. Those are promises rather than
+    /// measurements, and `checkDriftAndSync` has to know the difference — so every other
+    /// caller, all of which anchor something measured, clears the mark by writing.
+    private func anchorPosition(
+        _ positionMs: UInt32,
+        at time: Double = CACurrentMediaTime(),
+        optimistic: Bool = false,
+    ) {
         positionAnchorMs = positionMs
         positionAnchorTime = time
+        optimisticAnchorTime = optimistic ? CACurrentMediaTime() : nil
+    }
+
+    /// Restarts interpolation at the position already held, without claiming to have
+    /// measured it.
+    ///
+    /// Resume is the only caller: it moves neither the position nor its truth, just the
+    /// clock. Going through `anchorPosition` instead would re-assign the position to
+    /// itself and, worse, clear the optimistic mark — telling `checkDriftAndSync` that a
+    /// seek made while paused had been confirmed, when resuming confirms nothing.
+    private func restartPositionClock() {
+        positionAnchorTime = CACurrentMediaTime()
     }
 
     /// The position to report while playback is not advancing.
@@ -1404,10 +1440,53 @@ final class PlaybackViewModel {
         // Remote playback position is interpolated from cluster timestamp, not real-time.
         // Compare even when the Rust value did not change: a frozen value is precisely the
         // signal that must pull a still-running Swift clock back to reality.
+        //
+        // The two directions are not the same measurement, so they do not share a
+        // threshold. Rust reports where the *decoder* is, and the decoder runs ahead of
+        // what is audible by whatever `AudioRenderer` still holds buffered — normally
+        // around `maxBufferAheadSeconds`, though that is a pacing target enforced by
+        // sleeping after a write rather than a ceiling, and re-arming the throttle on a
+        // route change can bank more.
+        //
+        // - **Display ahead of Rust** cannot come from buffering, since the decoder is
+        //   always in front. It means the Player stopped producing while our clock kept
+        //   running, which is the stall this check exists for. Half a second is plenty.
+        // - **Display behind Rust** is normally just that buffer, and correcting to it
+        //   would jump the bar forward into audio nobody has heard yet — the fight with
+        //   the Spirc position that made the bar jitter through a context's first track.
+        //
+        // The exception in both directions is an anchor a transport command wrote ahead of
+        // playback. That is a promise, not a measurement, and the two disagree by design
+        // until the command lands — so nothing can be judged inside the grace window. Past
+        // it, an optimistic anchor that no measurement has confirmed is one Rust never
+        // carried out: `performSeek` rolls back a command it could not *issue*, but one
+        // that was issued and then rejected reports nothing back, since
+        // `SpotifyPlayer.seek` discards the FFI result. Then either direction is evidence,
+        // because the display is somewhere playback never went.
         if SpotifyPlayer.isActiveDevice {
             let rustPosition = SpotifyPlayer.positionMs
-            let drift = abs(Int64(rustPosition) - Int64(interpolatedPositionMs))
-            if drift > 500 {
+            let displayedPosition = interpolatedPositionMs
+            let displayedLead = Int64(displayedPosition) - Int64(rustPosition)
+
+            let unconfirmedFor = optimisticAnchorTime.map { CACurrentMediaTime() - $0 }
+            let correct = switch unconfirmedFor {
+            case let .some(elapsed) where elapsed < Self.optimisticAnchorGrace: false
+            case .some: abs(displayedLead) > Self.positionDisagreementMs
+            case .none: displayedLead > Self.positionDisagreementMs
+            }
+
+            // One grace window, one verdict. A measurement clears the mark by arriving,
+            // but nothing guarantees one does: a rejected command produces no callback,
+            // and a command issued while paused or while a remote device held the floor is
+            // not judged here at all. Expiring the mark on the tick that judges it is what
+            // stops it outliving its command — otherwise it sits set for the session, and
+            // the buffer lead that turns up later reads as evidence of a lost seek.
+            if let unconfirmedFor, unconfirmedFor >= Self.optimisticAnchorGrace {
+                optimisticAnchorTime = nil
+            }
+
+            if correct {
+                debugLog("PlaybackViewModel", "Drift correction: \(displayedPosition) -> \(rustPosition)")
                 anchorPosition(rustPosition)
                 didCorrectDrift = true
             }
