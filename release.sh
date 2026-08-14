@@ -184,7 +184,13 @@ echo -e "${YELLOW}Updating 'latest' tag...${NC}"
 cp "${ZIP_NAME}" "Spotifly-latest.zip"
 
 # Main repo
+# The tag has to go with the release: deleting a release leaves its tag behind, and
+# `gh release create` reuses an existing one rather than moving it — so without this the
+# 'latest' release keeps pointing at whatever commit first created the tag. Its assets are
+# still replaced, but the source-code links serve that old tree, and GitHub orders releases
+# by tag date, which buries 'latest' at the bottom of the page.
 gh release delete latest --yes --repo ralph/spotifly 2>/dev/null || true
+gh api -X DELETE repos/ralph/spotifly/git/refs/tags/latest &>/dev/null || true
 gh release create latest \
     "${ZIP_NAME}" \
     --title "Spotifly (Latest)" \
@@ -205,6 +211,7 @@ gh release upload latest "Spotifly-latest.zip" --clobber --repo ralph/spotifly
 
 # homebrew-spotifly (temporary)
 gh release delete latest --yes --repo ralph/homebrew-spotifly 2>/dev/null || true
+gh api -X DELETE repos/ralph/homebrew-spotifly/git/refs/tags/latest &>/dev/null || true
 gh release create latest \
     "${ZIP_NAME}" \
     --title "Spotifly (Latest)" \
