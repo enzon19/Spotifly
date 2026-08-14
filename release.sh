@@ -126,8 +126,13 @@ if [ "$REPLACE_EXISTING" = true ]; then
     echo -e "\n${YELLOW}Deleting existing release v${VERSION}...${NC}"
     gh release delete "v${VERSION}" --yes --repo ralph/spotifly 2>/dev/null || true
     gh release delete "v${VERSION}" --yes --repo ralph/homebrew-spotifly 2>/dev/null || true
-    # Also delete the tags
-    git push --delete origin "v${VERSION}" 2>/dev/null || true
+    # Also delete the tags, on both repos: a release delete leaves its tag, and the recreate
+    # below reuses it rather than moving it, so the replacement would point at the first
+    # attempt's commit. Named per repo rather than pushed to `origin`, which from here is
+    # only ever the app repo.
+    gh api -X DELETE "repos/ralph/spotifly/git/refs/tags/v${VERSION}" &>/dev/null || true
+    gh api -X DELETE "repos/ralph/homebrew-spotifly/git/refs/tags/v${VERSION}" &>/dev/null || true
+    git tag -d "v${VERSION}" &>/dev/null || true
 fi
 
 # Extract changelog entry for this version
