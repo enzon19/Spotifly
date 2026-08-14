@@ -41,6 +41,7 @@ struct LoggedInLifecycleModifier: ViewModifier {
                 deviceService.activate()
                 connectionService.activate()
                 playbackViewModel.setStore(store)
+                playbackViewModel.setQueueService(queueService)
 
                 #if DEBUG
                     AppStore.current = store
@@ -60,7 +61,12 @@ struct LoggedInLifecycleModifier: ViewModifier {
                 }
 
                 do {
-                    _ = try await SpotifyAPI.fetchAvailableDevices(accessToken: token)
+                    // The response is kept, not just checked. Without it the device table
+                    // stays empty until Speakers is opened, and `activeDeviceId` is derived
+                    // from that table — so a user who has not authorized local streaming
+                    // would be told nothing can play, while their phone is playing.
+                    let devices = try await SpotifyAPI.fetchAvailableDevices(accessToken: token)
+                    store.upsertDevices(devices.devices)
                 } catch SpotifyAPIError.forbidden {
                     blockingState = .premiumRequired
                     return
@@ -76,9 +82,8 @@ struct LoggedInLifecycleModifier: ViewModifier {
                 _ = await (topArtists, topTracks, recentlyPlayed)
 
                 playbackViewModel.setTokenProvider { await session.validAccessToken() }
-                SpotifyPlayer.setTokenProvider(session)
 
-                await playbackViewModel.initializeIfNeeded(accessToken: token)
+                await playbackViewModel.initializeIfNeeded()
                 await queueService.fetchInitialPlaybackState(accessToken: token)
             }
             // Connection handling is driven by the connection snapshot, not by the Connect
@@ -133,8 +138,7 @@ struct LoggedInLifecycleModifier: ViewModifier {
                     // there is no running recovery for it to disturb.
                     debugLog("LoggedInLifecycle", "System wake detected, no session — rebuilding")
                     Task {
-                        let token = await session.validAccessToken()
-                        await playbackViewModel.forceReinitialize(accessToken: token)
+                        await playbackViewModel.forceReinitialize()
                     }
                 }
             }

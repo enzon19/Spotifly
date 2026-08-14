@@ -46,9 +46,38 @@ typedef enum __attribute__((enum_extensibility(open))) SpotiflyResult : int32_t 
 // Playback functions
 // ============================================================================
 
-/// Initializes the player with the given access token.
+/// Initializes the player.
 /// Must be called before play/pause operations.
-SpotiflyResult spotifly_init_player(const char* access_token);
+///
+/// @param access_token A token minted with librespot's client id, or NULL to connect from
+///                     the credentials cached by spotifly_authorize_streaming(). NULL is the
+///                     normal case: only the first init after a grant carries a token.
+SpotiflyResult spotifly_init_player(const char* _Nullable access_token);
+
+/// Runs the one-time streaming authorization: opens the browser, waits for the loopback
+/// callback, exchanges the code, connects, and persists the credentials.
+///
+/// Blocks on a human, so never call this on the main thread. There is no cancellation; the
+/// flow terminates on its own.
+///
+/// Returns:
+///    0 = Authorized, credentials cached
+///   -1 = Failed
+///   -2 = Superseded by a logout; any credentials written were removed again
+int32_t spotifly_authorize_streaming(void);
+
+/// Whether a streaming grant has already been completed on this machine.
+/// Returns 1 when credentials are cached, 0 otherwise.
+int32_t spotifly_has_streaming_credentials(void);
+
+/// The Spotify account id the last successful grant authenticated as, or NULL.
+/// The caller owns the string and must free it with spotifly_free_string().
+char* _Nullable spotifly_last_grant_account(void);
+
+/// Removes the cached streaming credentials.
+/// Call on logout, after the session teardown, so the next launch cannot connect the
+/// account that just logged out. Removing credentials that are not there is not an error.
+void spotifly_clear_streaming_credentials(void);
 
 /// Plays multiple tracks in sequence.
 ///
@@ -173,20 +202,6 @@ void spotifly_register_session_client_changed_callback(SessionClientChangedCallb
 /// Returns 1 if session is connected and ready for commands, 0 otherwise.
 /// Use this to check if playback commands will be accepted.
 int32_t spotifly_is_session_connected(void);
-
-/// Callback function type for token request notifications.
-/// Called when Rust's reconnection loop needs a fresh access token.
-typedef void (*TokenRequestCallback)(void);
-
-/// Registers a callback to receive token request notifications.
-/// When Rust needs a fresh token to reconnect, it calls this callback.
-/// Swift should respond by calling spotifly_set_token() with a fresh access token.
-void spotifly_register_token_request_callback(TokenRequestCallback callback);
-
-/// Provides a fresh access token for reconnection.
-/// Called by Swift in response to the token request callback.
-/// The token is passed to the pending reconnection attempt.
-void spotifly_set_token(const char* token);
 
 /// Forces a reconnection to Spotify servers.
 /// Use this after system wake to ensure a fresh connection before playback.

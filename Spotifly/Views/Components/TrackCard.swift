@@ -12,7 +12,6 @@ struct TrackCard: View {
     @Bindable var playbackViewModel: PlaybackViewModel
     var currentSection: NavigationItem = .searchResults
 
-    @Environment(SpotifySession.self) private var session
     @Environment(TrackService.self) private var trackService
     @Environment(\.displayScale) private var displayScale
 
@@ -83,10 +82,7 @@ struct TrackCard: View {
 
     private func playTrack() {
         Task {
-            // Ensure player is initialized before starting radio
-            let token = await session.validAccessToken()
-            await playbackViewModel.initializeIfNeeded(accessToken: token)
-            SpotifyPlayer.playRadio(trackUri: track.uri)
+            await playbackViewModel.playRadio(trackUri: track.uri)
         }
     }
 }

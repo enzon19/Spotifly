@@ -59,6 +59,26 @@ struct QueueItem: Identifiable, Equatable, Encodable {
     }
 }
 
+/// Outcome of the one-time streaming authorization.
+///
+/// `nonisolated` because the grant runs detached — it blocks on a human — so the exit code is
+/// mapped off the main actor.
+nonisolated enum StreamingAuthResult: Equatable {
+    case authorized
+    case failed
+    /// A logout landed while the grant was in flight, and the credentials it wrote were
+    /// removed again. Nothing went wrong, so this is reported as neither success nor error.
+    case superseded
+
+    init(code: Int32) {
+        switch code {
+        case 0: self = .authorized
+        case -2: self = .superseded
+        default: self = .failed
+        }
+    }
+}
+
 /// Queue state containing current, next, and previous tracks (nonisolated for C callback compatibility)
 struct QueueState {
     nonisolated let currentTrack: QueueItem?
@@ -457,9 +477,6 @@ private nonisolated func handleBecameActiveCallback() {
     }
 }
 
-/// Weak reference to the SpotifySession for token requests during reconnection
-private nonisolated(unsafe) var tokenProviderSession: SpotifySession?
-
 /// Registers the active device callback with Rust (fires on every cluster update)
 private nonisolated func registerActiveDeviceCallback() {
     spotifly_register_active_device_callback { deviceIdPtr in
@@ -473,35 +490,6 @@ private nonisolated func handleActiveDeviceCallback(_ deviceIdPtr: UnsafePointer
     let deviceId = String(cString: deviceIdPtr)
     Task { @MainActor in
         activeDeviceSubject.send(deviceId)
-    }
-}
-
-/// Registers the token request callback with Rust (fires when reconnection needs a fresh token)
-private nonisolated func registerTokenRequestCallback() {
-    spotifly_register_token_request_callback {
-        handleTokenRequestCallback()
-    }
-}
-
-/// C callback for token request notifications from Rust
-/// Fires when Rust's reconnection loop needs a fresh access token
-private nonisolated func handleTokenRequestCallback() {
-    debugLog("SpotifyPlayer", "Token request received from Rust")
-    Task { @MainActor in
-        guard let session = tokenProviderSession else {
-            debugLog("SpotifyPlayer", "No session available for token request")
-            return
-        }
-
-        let token = await session.validAccessToken()
-        debugLog("SpotifyPlayer", "Providing fresh token to Rust (\(token.prefix(20))...)")
-
-        // Call Rust FFI on background thread
-        Task.detached {
-            token.withCString { tokenPtr in
-                spotifly_set_token(tokenPtr)
-            }
-        }
     }
 }
 
@@ -630,7 +618,7 @@ enum SpotifyPlayer {
     /// Initializes the player with the given access token.
     /// Must be called before any playback operations.
     @SpotifyAuthActor
-    static func initialize(accessToken: String) async throws {
+    static func initialize() async throws {
         // Register callbacks (via nonisolated helpers to avoid actor isolation issues)
         registerAudioDataCallback()
         registerAudioControlCallback()
@@ -645,7 +633,6 @@ enum SpotifyPlayer {
         registerSessionClientChangedCallback()
         registerConnectionStateCallback()
         registerActiveDeviceCallback()
-        registerTokenRequestCallback()
 
         // Sync playback settings from UserDefaults before initializing
         syncSettingsFromUserDefaults()
@@ -656,22 +643,17 @@ enum SpotifyPlayer {
             spotifly_cleanup()
         }.value
 
+        // No token: the session connects from the credentials the streaming grant cached.
+        // Passing the Web API token here is what login5 rejects — it is minted with the
+        // user's dashboard client id, and Spotify no longer accepts stored credentials
+        // derived from one. See plans/streaming-auth-needs-a-first-party-client-id.md.
         let result = await Task.detached {
-            accessToken.withCString { tokenPtr in
-                spotifly_init_player(tokenPtr)
-            }
+            spotifly_init_player(nil)
         }.value
 
         guard result == .ok else {
             throw SpotifyPlayerError.initializationFailed
         }
-    }
-
-    /// Sets the session to use for token requests during automatic reconnection.
-    /// Call this after initializing the player with the session that can provide fresh tokens.
-    @MainActor
-    static func setTokenProvider(_ session: SpotifySession) {
-        tokenProviderSession = session
     }
 
     /// Returns a publisher for queue updates.
@@ -1050,6 +1032,45 @@ enum SpotifyPlayer {
         _ body: @escaping @Sendable () -> SpotiflyResult,
     ) async -> Bool {
         await Task.detached(priority: .userInitiated) { body() == .ok }.value
+    }
+
+    /// Runs the one-time streaming authorization.
+    ///
+    /// Opens the browser, waits for the loopback callback, and lets librespot persist the
+    /// credentials every later init connects from. Blocks on a human, so it runs detached —
+    /// never on the main actor. There is no cancellation: the flow terminates on its own,
+    /// and the alert's Cancel declines before this is called at all.
+    static func authorizeStreaming() async -> StreamingAuthResult {
+        // `.utility`, not `.userInitiated`: this waits on a human finishing a browser flow,
+        // and librespot-oauth exchanges the code on a plain `std::thread` at default QoS
+        // while blocking on its result. A user-initiated caller parked on that lower-QoS
+        // worker is a priority inversion, which the runtime reports.
+        await Task.detached(priority: .utility) {
+            StreamingAuthResult(code: spotifly_authorize_streaming())
+        }.value
+    }
+
+    /// Whether a streaming grant has already been completed on this machine.
+    static func hasCachedStreamingCredentials() -> Bool {
+        spotifly_has_streaming_credentials() == 1
+    }
+
+    /// The Spotify account id the last successful grant authenticated as.
+    ///
+    /// The browser runs the grant with whatever account it is signed into, which need not
+    /// be the one the Web API half is using.
+    static func lastGrantAccountId() -> String? {
+        guard let ptr = spotifly_last_grant_account() else { return nil }
+        defer { spotifly_free_string(ptr) }
+        return String(cString: ptr)
+    }
+
+    /// Removes the cached streaming credentials so the next launch cannot connect the
+    /// account that just logged out.
+    static func clearStreamingCredentials() async {
+        await Task.detached(priority: .userInitiated) {
+            spotifly_clear_streaming_credentials()
+        }.value
     }
 
     /// Transfers playback from another Spotify Connect device to this local player.

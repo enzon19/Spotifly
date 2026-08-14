@@ -89,12 +89,6 @@ static SHUFFLE_STATE: AtomicBool = AtomicBool::new(false);
 static REPEAT_TRACK_STATE: AtomicBool = AtomicBool::new(false);
 static REPEAT_CONTEXT_STATE: AtomicBool = AtomicBool::new(false);
 
-// Token request callback - Rust requests fresh token from Swift for reconnection
-static TOKEN_REQUEST_CALLBACK: Lazy<Mutex<Option<extern "C" fn()>>> =
-    Lazy::new(|| Mutex::new(None));
-// Channel for receiving token from Swift (set via spotifly_set_token)
-static PENDING_TOKEN: Lazy<Mutex<Option<tokio::sync::oneshot::Sender<String>>>> =
-    Lazy::new(|| Mutex::new(None));
 // Flag to track if reconnection is in progress
 static RECONNECTING: AtomicBool = AtomicBool::new(false);
 // Flag to track intentional shutdown (prevents reconnection attempts during app quit)
@@ -379,6 +373,19 @@ fn elapsed_since_wake_ms() -> u64 {
 // check unreachable. Now that a rebuild replaces the listener along with its session, the
 // listener captures the value directly and the check does what it claims.
 static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Bumped only when the account itself goes away — logout, or app termination. Distinct from
+/// `SESSION_GENERATION`, which moves on every ordinary rebuild: cleanup and
+/// `build_player_async` both advance it, so a long-running streaming grant waiting on a
+/// browser would see any concurrent play, retry or wake as a supersession and delete the
+/// credentials it had just written.
+static LOGOUT_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The Spotify account the last successful streaming grant authenticated as.
+///
+/// The browser may be signed into a different account than the Web API half, and nothing
+/// else would notice: the app would browse one account while playing from another. Swift
+/// compares this against `/me` before accepting the grant.
+static LAST_GRANT_ACCOUNT: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 /// Generation created by the most recent `build_player_async`. Lets the reconnect loop adopt
 /// the generation its own attempt made rather than whatever the counter reads afterwards,
 /// which may belong to a logout and the login that followed it.
@@ -715,40 +722,6 @@ pub extern "C" fn spotifly_register_active_device_callback(callback: extern "C" 
     *ACTIVE_DEVICE_CALLBACK.lock().unwrap() = Some(callback);
 }
 
-/// Registers a callback for token requests during reconnection.
-/// When Rust needs a fresh token to reconnect, it calls this callback.
-/// Swift should respond by calling spotifly_set_token() with a fresh access token.
-#[no_mangle]
-pub extern "C" fn spotifly_register_token_request_callback(callback: extern "C" fn()) {
-    *TOKEN_REQUEST_CALLBACK.lock().unwrap() = Some(callback);
-}
-
-/// Provides a fresh access token for reconnection.
-/// Called by Swift in response to the token request callback.
-/// The token is passed to the pending reconnection attempt.
-#[no_mangle]
-pub extern "C" fn spotifly_set_token(token: *const c_char) {
-    let Some(token_str) = (unsafe { c_string_arg(token) }) else {
-        debug!("spotifly_set_token: token is null or not valid UTF-8");
-        return;
-    };
-
-    debug!(
-        "spotifly_set_token: received token ({} chars)",
-        token_str.len()
-    );
-
-    // Send token to waiting reconnection task
-    let mut pending = PENDING_TOKEN.lock().unwrap();
-    if let Some(sender) = pending.take() {
-        if sender.send(token_str).is_err() {
-            debug!("spotifly_set_token: receiver dropped");
-        }
-    } else {
-        debug!("spotifly_set_token: no pending token request");
-    }
-}
-
 /// Registers a callback to receive connection state change notifications.
 /// Called whenever the connection state changes (connect, disconnect, error, etc.).
 /// The callback receives JSON with full connection state.
@@ -853,18 +826,231 @@ fn notify_connection_state_change() {
     }
 }
 
-/// Creates a new (unconnected) Session with the given device ID and access token.
+/// Scopes requested for the streaming session, mirroring librespot's own list.
+///
+/// These are granted to librespot's client id and have nothing to do with the Web API scopes
+/// Swift requests with the user's dashboard client id — the two grants are independent.
+static STREAMING_SCOPES: &[&str] = &[
+    "app-remote-control",
+    "playlist-modify",
+    "playlist-modify-private",
+    "playlist-modify-public",
+    "playlist-read",
+    "playlist-read-collaborative",
+    "playlist-read-private",
+    "streaming",
+    "ugc-image-upload",
+    "user-follow-modify",
+    "user-follow-read",
+    "user-library-modify",
+    "user-library-read",
+    "user-modify",
+    "user-modify-playback-state",
+    "user-modify-private",
+    "user-personalized",
+    "user-read-birthdate",
+    "user-read-currently-playing",
+    "user-read-email",
+    "user-read-play-history",
+    "user-read-playback-position",
+    "user-read-playback-state",
+    "user-read-private",
+    "user-read-recently-played",
+    "user-top-read",
+];
+
+/// Whether the run that started at `started_generation` has been superseded.
+fn run_is_superseded(started_generation: u64, current_generation: u64) -> bool {
+    started_generation != current_generation
+}
+
+/// Asks the OS for a free loopback port by binding port 0 and reading back the assignment.
+///
+/// Spotify accepts any loopback port for librespot's client id, so nothing has to be
+/// registered in advance. There is an unavoidable gap between releasing this and the OAuth
+/// listener binding it; losing that race fails the grant, and the user retries.
+fn pick_free_loopback_port() -> Result<u16, String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| format!("Could not reserve a loopback port: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("Could not read the reserved port: {e}"))?
+        .port();
+    drop(listener);
+    Ok(port)
+}
+
+/// Where librespot persists the AP credentials produced by the streaming grant.
+///
+/// Under the sandbox `HOME` is already the app container, so this stays inside it.
+fn credentials_cache_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    std::path::Path::new(&home)
+        .join("Library")
+        .join("Application Support")
+        .join("Spotifly")
+        .join("credentials")
+}
+
+/// Removes cached credentials from `dir`, treating "not there" as success.
+///
+/// Takes the directory rather than reading `credentials_cache_dir()` so it can be tested
+/// against a temporary one: `cargo test` runs unsandboxed, where that path resolves to the
+/// developer's real credentials.
+fn clear_credentials_at(dir: &std::path::Path) {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => debug!("Cleared streaming credentials"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => debug!("Could not remove streaming credentials: {}", e),
+    }
+}
+
+/// Removes the cached streaming credentials. Called on logout, after the session teardown,
+/// so that the next launch cannot connect the account that just logged out.
+#[no_mangle]
+pub extern "C" fn spotifly_clear_streaming_credentials() {
+    clear_credentials_at(&credentials_cache_dir());
+}
+
+/// The Spotify account id the last successful streaming grant authenticated as, or null.
+/// Free with `spotifly_free_string`.
+#[no_mangle]
+pub extern "C" fn spotifly_last_grant_account() -> *mut c_char {
+    let account = LAST_GRANT_ACCOUNT.lock().unwrap().clone();
+    match account.and_then(|a| CString::new(a).ok()) {
+        Some(c) => c.into_raw(),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Whether a streaming grant has already been completed on this machine.
+///
+/// This is what makes the local device's absence explainable: without credentials there is
+/// nothing to register with Spotify Connect, so Spotifly is genuinely not in the device list.
+#[no_mangle]
+pub extern "C" fn spotifly_has_streaming_credentials() -> i32 {
+    let cached = Cache::new(Some(credentials_cache_dir()), None, None, None)
+        .ok()
+        .and_then(|cache| cache.credentials());
+
+    match cached {
+        Some(_) => 1,
+        None => 0,
+    }
+}
+
+/// Runs the one-time streaming authorization: opens the browser, waits for the loopback
+/// callback, exchanges the code, connects, and lets librespot persist the AP credentials.
+///
+/// Returns 0 on success, -1 on failure, -2 if the run was superseded. There is no in-flight
+/// cancellation: the alert's Cancel declines before this is ever called, and interrupting a
+/// listener parked in a blocking read would cost more machinery than it buys.
+///
+/// Blocks on a human, so Swift must never call this on the main thread.
+#[no_mangle]
+pub extern "C" fn spotifly_authorize_streaming() -> i32 {
+    let started_generation = LOGOUT_GENERATION.load(Ordering::SeqCst);
+
+    let port = match pick_free_loopback_port() {
+        Ok(p) => p,
+        Err(e) => {
+            debug!("Streaming authorization error: {}", e);
+            return -1;
+        }
+    };
+
+    // librespot's own client id, never the user's dashboard one: only a first-party id can
+    // obtain the client token that login5 requires.
+    let client_id = SessionConfig::default().client_id;
+    let client = match librespot_oauth::OAuthClientBuilder::new(
+        &client_id,
+        &format!("http://127.0.0.1:{}/login", port),
+        STREAMING_SCOPES.to_vec(),
+    )
+    .open_in_browser()
+    .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            debug!("Streaming authorization error: {}", e);
+            return -1;
+        }
+    };
+
+    let token = match client.get_access_token() {
+        Ok(t) => t,
+        Err(e) => {
+            debug!("Streaming authorization failed: {}", e);
+            return -1;
+        }
+    };
+    debug!("Streaming authorization: token obtained, connecting");
+
+    // Connect once so librespot writes the AP credentials into the cache. Every init after
+    // this connects from that cache with no token at all.
+    let result = RUNTIME.block_on(async {
+        let device_id = format!("spotifly_{}", std::process::id());
+        let (session, credentials) = create_session(&device_id, Some(&token.access_token))?;
+        session
+            .connect(credentials, true)
+            .await
+            .map_err(|e| format!("Connect failed: {:?}", e))?;
+        // Recorded before shutdown: this is the account the browser was signed into, which
+        // Swift compares against the Web API account before accepting the grant.
+        *LAST_GRANT_ACCOUNT.lock().unwrap() = Some(session.username().to_string());
+        session.shutdown();
+        Ok::<(), String>(())
+    });
+
+    if let Err(e) = result {
+        debug!("Streaming authorization connect error: {}", e);
+        return -1;
+    }
+
+    // Rechecked *after* the write, not before: librespot persists from inside
+    // Session::connect, so a logout landing mid-connect would wipe the cache and this run
+    // would then recreate it behind logout's back. Against LOGOUT_GENERATION, not the
+    // session one: an ordinary rebuild during the browser wait is not a supersession.
+    if run_is_superseded(started_generation, LOGOUT_GENERATION.load(Ordering::SeqCst)) {
+        debug!("Streaming authorization superseded; removing the credentials it wrote");
+        clear_credentials_at(&credentials_cache_dir());
+        return -2;
+    }
+
+    debug!("Streaming authorization complete");
+    0
+}
+
+/// Creates a new (unconnected) Session with the given device ID.
+///
+/// `access_token` is `Some` only for the first connect after the streaming grant. Every later
+/// init passes `None` and connects from the credentials librespot cached then — which is the
+/// point of the cache: no token, no refresh, no round-trip before connecting.
+///
+/// The token must be one minted with librespot's own client id. A Web API token minted with
+/// the user's dashboard client id authenticates with the AP but is rejected by login5, which
+/// is what took playback down entirely; see
+/// `plans/streaming-auth-needs-a-first-party-client-id.md`.
 fn create_session(
     device_id: &str,
-    access_token: &str,
+    access_token: Option<&str>,
 ) -> Result<(Session, librespot_core::authentication::Credentials), String> {
     let session_config = SessionConfig {
         device_id: device_id.to_string(),
         ..Default::default()
     };
-    let credentials = librespot_core::authentication::Credentials::with_access_token(access_token);
-    let cache = Cache::new(None::<std::path::PathBuf>, None, None, None)
+    let cache = Cache::new(Some(credentials_cache_dir()), None, None, None)
         .map_err(|e| format!("Cache error: {}", e))?;
+
+    // Prefer a freshly granted token; otherwise reuse what the last grant cached. Resolved
+    // here rather than at the call site so every caller gets the same rule.
+    let credentials = match access_token {
+        Some(token) => librespot_core::authentication::Credentials::with_access_token(token),
+        None => cache
+            .credentials()
+            .ok_or_else(|| "No streaming credentials: authorization required".to_string())?,
+    };
+
     let session = Session::new(session_config, Some(cache));
     Ok((session, credentials))
 }
@@ -1053,19 +1239,8 @@ fn spawn_cluster_listener(session: &Session, generation: u64) -> Result<(), Stri
     Ok(())
 }
 
-/// Request a fresh token from Swift via callback
-fn request_token_from_swift() {
-    match registered_callback(&TOKEN_REQUEST_CALLBACK) {
-        Some(callback) => {
-            debug!("Requesting fresh token from Swift");
-            callback();
-        }
-        None => debug!("No token request callback registered"),
-    }
-}
-
 /// Spawns the reconnection loop task.
-/// Uses exponential backoff and requests fresh tokens from Swift.
+/// Uses exponential backoff and rebuilds from the cached streaming credentials.
 fn spawn_reconnection_loop(intent: RecoveryIntent) {
     // Check if already reconnecting
     if RECONNECTING.swap(true, Ordering::SeqCst) {
@@ -1143,44 +1318,11 @@ fn spawn_reconnection_loop(intent: RecoveryIntent) {
             });
             notify_connection_state_change();
 
-            let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-            {
-                let mut pending = PENDING_TOKEN.lock().unwrap();
-                *pending = Some(tx);
-            }
-            request_token_from_swift();
-
-            let token_result = tokio::time::timeout(Duration::from_secs(10), rx).await;
-
-            let token = match token_result {
-                Ok(Ok(t)) => t,
-                Ok(Err(_)) => {
-                    debug!("[WAKE +{}ms] Token channel closed", elapsed_since_wake_ms());
-                    continue;
-                }
-                Err(_) => {
-                    debug!(
-                        "[WAKE +{}ms] Token request timed out",
-                        elapsed_since_wake_ms()
-                    );
-                    continue;
-                }
-            };
-
-            // Re-check after the token round-trip: requesting one from Swift can take up
-            // to ten seconds, which is plenty of time for a restart to land.
-            if !reconnect_may_proceed(
-                recovering_generation,
-                SESSION_GENERATION.load(Ordering::SeqCst),
-                teardown_in_progress(),
-            ) {
-                debug!(
-                    "[WAKE +{}ms] Abandoning reconnect: state changed while fetching token",
-                    elapsed_since_wake_ms()
-                );
-                RECONNECTING.store(false, Ordering::SeqCst);
-                return;
-            }
+            // No token is fetched here. Swift's token is minted with the user's dashboard
+            // client id, which login5 now rejects — a reconnect built on one fails exactly
+            // where the original outage did. The credentials cached by the streaming grant
+            // are what a rebuild connects from, so the ten-second round-trip that used to
+            // sit here, and the re-check that existed only to cover it, are both gone.
 
             // One recovery strategy: tear everything down and rebuild Session, Player,
             // Mixer and Spirc as a single generation, then restore the captured intent.
@@ -1196,7 +1338,7 @@ fn spawn_reconnection_loop(intent: RecoveryIntent) {
 
             // Rehydration happens inside init_player_async, so that the session is fully
             // settled before its readiness is published. See the note there.
-            match init_player_async(&token, intent.was_active, intent.should_resume()).await {
+            match init_player_async(None, intent.was_active, intent.should_resume()).await {
                 Ok(_) => {
                     debug!(
                         "[WAKE +{}ms] Reconnect successful on attempt {}",
@@ -1340,10 +1482,9 @@ pub extern "C" fn spotifly_init_player(access_token: *const c_char) -> i32 {
     SHUTTING_DOWN.store(false, Ordering::SeqCst);
     SLEEPING.store(false, Ordering::SeqCst);
 
-    let Some(token_str) = (unsafe { c_string_arg(access_token) }) else {
-        debug!("Player init error: access_token is null or not valid UTF-8");
-        return -1;
-    };
+    // A null token means "connect from the cached streaming credentials", which is the normal
+    // case: only the first init after the one-time grant carries a token.
+    let token_str = unsafe { c_string_arg(access_token) };
 
     // Check if we already have a session
     {
@@ -1354,7 +1495,8 @@ pub extern "C" fn spotifly_init_player(access_token: *const c_char) -> i32 {
         }
     }
 
-    let result = RUNTIME.block_on(async { init_player_async(&token_str, false, false).await });
+    let result =
+        RUNTIME.block_on(async { init_player_async(token_str.as_deref(), false, false).await });
 
     match result {
         Ok(_) => 0,
@@ -1424,7 +1566,7 @@ fn create_new_player(session: &Session) -> Arc<Player> {
 /// logout there is no next attempt: the loop sees the teardown flag and exits, leaving a
 /// live session for an account that is gone.
 async fn init_player_async(
-    access_token: &str,
+    access_token: Option<&str>,
     activate_after_connect: bool,
     resume_after_connect: bool,
 ) -> Result<(), String> {
@@ -1440,7 +1582,7 @@ async fn init_player_async(
 }
 
 async fn build_player_async(
-    access_token: &str,
+    access_token: Option<&str>,
     activate_after_connect: bool,
     resume_after_connect: bool,
 ) -> Result<(), String> {
@@ -2617,6 +2759,10 @@ pub extern "C" fn spotifly_shutdown() -> i32 {
     // Prevent reconnection attempts during intentional shutdown
     SHUTTING_DOWN.store(true, Ordering::SeqCst);
 
+    // The account is going away, so any streaming grant still waiting on a browser no longer
+    // belongs to anyone. Only here — not in cleanup, which runs on every ordinary rebuild.
+    LOGOUT_GENERATION.fetch_add(1, Ordering::SeqCst);
+
     // Publish the truth now rather than waiting for the listeners to notice the channel
     // close. A snapshot still claiming a connected session and a ready Spirc after an
     // intentional shutdown is what lets Swift adopt the dead session as a healthy one — on
@@ -3382,5 +3528,117 @@ mod tests {
     fn no_local_device_id_is_never_active() {
         assert!(!is_active_in_cluster("phone-abc", None));
         assert!(!is_active_in_cluster("", None));
+    }
+
+    // The streaming session connects from credentials cached on disk, so that every init
+    // after the one-time grant needs no token at all. See
+    // plans/streaming-auth-needs-a-first-party-client-id.md.
+
+    #[test]
+    fn credentials_cache_dir_is_absolute_and_app_scoped() {
+        let dir = credentials_cache_dir();
+        assert!(dir.is_absolute(), "cache dir must be absolute: {dir:?}");
+        assert!(
+            dir.ends_with("Spotifly/credentials"),
+            "cache dir must be app-scoped: {dir:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_is_superseded_when_the_generation_moves() {
+        // The grant writes credentials from inside Session::connect, so a logout landing
+        // mid-connect must be detected afterwards — see AGENTS.md, a superseded run must
+        // not write.
+        assert!(!run_is_superseded(4, 4));
+        assert!(run_is_superseded(4, 5));
+        // A teardown that reset the counter is a supersession too, not a match.
+        assert!(run_is_superseded(4, 0));
+    }
+
+    /// Serialises the tests that drive the real FFI entry points. Everything else here is a
+    /// pure predicate and needs no lock, but these mutate process-wide generation counters
+    /// and the suite runs in parallel.
+    static GLOBAL_STATE: Mutex<()> = Mutex::new(());
+
+    fn lock_global_state() -> std::sync::MutexGuard<'static, ()> {
+        GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn routine_cleanup_does_not_supersede_a_grant() {
+        let _guard = lock_global_state();
+        // A grant waits on a human in a browser, which is long enough for an ordinary play,
+        // retry or wake to rebuild the player underneath it. Those bump SESSION_GENERATION;
+        // if the grant watched that counter it would report itself superseded and delete the
+        // credentials it had just written.
+        let before = LOGOUT_GENERATION.load(Ordering::SeqCst);
+        let session_before = SESSION_GENERATION.load(Ordering::SeqCst);
+
+        spotifly_cleanup();
+
+        assert_ne!(
+            SESSION_GENERATION.load(Ordering::SeqCst),
+            session_before,
+            "cleanup is expected to move the session generation"
+        );
+        assert_eq!(
+            LOGOUT_GENERATION.load(Ordering::SeqCst),
+            before,
+            "cleanup must not invalidate a streaming grant"
+        );
+    }
+
+    #[test]
+    fn shutdown_supersedes_a_grant() {
+        let _guard = lock_global_state();
+
+        // Logout and app termination both go through here, and both mean the account this
+        // grant belongs to is gone.
+        let before = LOGOUT_GENERATION.load(Ordering::SeqCst);
+
+        let _ = spotifly_shutdown();
+
+        assert!(run_is_superseded(
+            before,
+            LOGOUT_GENERATION.load(Ordering::SeqCst)
+        ));
+
+        // Leave the flag as the rest of the suite expects; init clears it in the app.
+        SHUTTING_DOWN.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn clearing_credentials_removes_the_directory() {
+        // Deliberately parameterised: cargo test runs unsandboxed, so exercising this
+        // against credentials_cache_dir() would delete the real credentials on this machine
+        // every time the suite ran.
+        let dir = std::env::temp_dir().join(format!("spotifly-creds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create cache dir");
+        std::fs::write(dir.join("credentials.json"), b"{}").expect("write credentials");
+        assert!(dir.exists());
+
+        clear_credentials_at(&dir);
+
+        assert!(!dir.exists(), "logout must not leave credentials behind");
+    }
+
+    #[test]
+    fn clearing_credentials_that_are_not_there_is_fine() {
+        // Logging out without ever having authorized streaming is ordinary, not an error.
+        let dir = std::env::temp_dir().join(format!("spotifly-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        clear_credentials_at(&dir);
+
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn picks_a_bindable_loopback_port() {
+        let port = pick_free_loopback_port().expect("a free port");
+        assert!(port >= 1024, "must not need root: {port}");
+        // Proves it is actually bindable, which is what the OAuth listener does next.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bindable");
+        drop(listener);
     }
 }

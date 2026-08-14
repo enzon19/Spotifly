@@ -11,6 +11,7 @@ struct SpeakersView: View {
     @Environment(SpotifySession.self) private var session
     @Environment(AppStore.self) private var store
     @Environment(DeviceService.self) private var deviceService
+    @Environment(AuthViewModel.self) private var authViewModel
     @Bindable var playbackViewModel: PlaybackViewModel
 
     /// Whether AirPlay is available (only when Spotifly is the active device)
@@ -71,6 +72,35 @@ struct SpeakersView: View {
                                 SpeakerRow(device: device)
                             }
                         }
+
+                        // Without a usable local player this Mac never registers with
+                        // Spotify Connect, so it is genuinely absent from the list above.
+                        // That absence is the indicator; this row is the way back.
+                        //
+                        // Keyed on whether playback actually works, not on whether a
+                        // credentials file exists: revoked or stale credentials leave the
+                        // file in place while every initialization fails, and keying on the
+                        // file would hide the only way to recover from exactly that.
+                        if !playbackViewModel.isLocalPlaybackAvailable {
+                            Button {
+                                Task { await authViewModel.authorizeStreaming(expectedAccountId: store.userId) }
+                            } label: {
+                                HStack {
+                                    if authViewModel.isAuthorizingStreaming {
+                                        ProgressView()
+                                            .progressViewStyle(.circular)
+                                            .scaleEffect(0.6)
+                                    } else {
+                                        Image(systemName: "laptopcomputer.slash")
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Text("speakers.enable_this_mac")
+                                    Spacer()
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(authViewModel.isAuthorizingStreaming)
+                        }
                     } header: {
                         Text("speakers.spotify_connect")
                     } footer: {
@@ -105,7 +135,7 @@ struct SpeakersView: View {
                     Section {
                         ConnectionStatusView {
                             let token = await session.validAccessToken()
-                            await playbackViewModel.forceReinitialize(accessToken: token)
+                            await playbackViewModel.forceReinitialize()
                             await deviceService.loadDevices(accessToken: token)
                         }
                     } header: {
