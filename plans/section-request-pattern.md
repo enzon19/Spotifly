@@ -1,5 +1,15 @@
 # Section navigation: one request, one pattern, one cache
 
+Status: **completed. Kept as the reference for the loading pattern**, which `CLAUDE.md`
+points at from *Network Request Deduplication* — the rules there (a key means one
+postcondition, check the cache before the token, a superseded run must not write, cache what
+was fetched rather than what is non-empty) are this plan's conclusions and are still in force.
+`InFlightRequests` and `BatchInFlightRequests` are the shipped result.
+
+Two things have moved since it was written. The endpoints it names are Web API ones that no
+longer exist — the same pattern now runs against pathfinder and spclient — and the four
+library sections share one `AppStore.loadLibraryPage` rather than a copy each.
+
 Branch: `improve-section-nav`
 
 ## Symptom

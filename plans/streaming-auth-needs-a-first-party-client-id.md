@@ -1,5 +1,11 @@
 # Playback dies at login5 because the streaming session uses a third-party client id
 
+Status: **resolved 2026-08-14. Kept as a record of the break and the reasoning.** The
+diagnosis here is what produced `plans/streaming-auth-implementation-plan.md` (shipped as
+#49) and then `plans/single-grant-partner-api.md`, which went further and retired the Web API
+grant entirely. The fix in the shipped app skips login5: one keymaster token serves the
+accesspoint session, pathfinder and spclient.
+
 Spotify changed a server-side rule on or around 2026-08-11. Spotifly's Rust layer can no
 longer initialise Spirc, so nothing plays locally. Browsing is unaffected.
 

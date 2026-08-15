@@ -1,5 +1,16 @@
 # Official Librespot Migration
 
+Status: **done, 2026-07-30. Kept as the record of how the fork question was settled.**
+Spotifly builds against unmodified official librespot; `rust/Cargo.toml` uses path
+dependencies into `../../librespot` with deliberately no revision pin, so testing a local
+librespot patch is a checkout and a rebuild. Known-good is `dev` @ `9c7d756`, which is what
+is checked out today. The evidence that retired both carried patches is in
+[README.md](README.md) under *How the fork question was settled*.
+
+One caveat from that verification is still open: it was a single run, and an outage while
+Spotifly is *inactive* — playback on another device, rehydration staying passive by design —
+has not been exercised.
+
 ## Goal
 
 Move Spotifly to an unmodified, pinned official librespot revision after replacing

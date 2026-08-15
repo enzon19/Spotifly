@@ -1,5 +1,20 @@
 # Streaming Auth Split — Implementation Plan
 
+Status: **shipped 2026-08-14 as #49, then superseded within the same day by
+`plans/single-grant-partner-api.md`.** Kept as a record; do not implement from it.
+
+The checkboxes below were never ticked, which makes this plan look open at a glance. It is
+not — the work shipped, and then its central design decision was reversed. This plan's
+architecture is **two independent grants**: the dashboard client id for the Web API, the
+keymaster client id for streaming. Track A of the single-grant plan retired the Web API
+outright, so there is now **one** grant and no dashboard app at all. Reading the two together
+in the wrong order is the trap this note exists to prevent.
+
+What survives from here is the diagnosis and the loopback mechanics, both of which the
+single-grant work built on directly: `ASWebAuthenticationSession` cannot serve this flow,
+Spotify rotates the refresh token on every refresh, and a grant landing mid-connect has to be
+cleaned up after the write rather than before it.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Restore local playback by minting the librespot session credential with Spotify's

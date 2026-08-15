@@ -1,6 +1,11 @@
 # Relinked tracks lose their logical identity and blank the Now Playing bar
 
-Status: **completed**
+Status: **completed 2026-07-31; its identity rule was reversed 2026-08-13. Historical.**
+The Rust-side half still stands: `Loading`, `Playing` and `Paused` remain the only owners of
+the logical track URI, and `TrackChanged` still contributes duration only. What no longer
+applies is the normalise-to-the-original-id rule this plan shares with
+`plans/web-api-track-relinking-identity.md`; see that plan's header and `CLAUDE.md` under
+*Track identity is the market id* for the rule in force.
 Components: `rust/src/lib.rs`, `Spotifly/ViewModels/PlaybackViewModel.swift`,
 `Spotifly/Views/NowPlayingBarView.swift`
 Found: 2026-07-31, while playing *At Night, Alone.* by Mike Posner

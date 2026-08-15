@@ -1,6 +1,19 @@
 # Web API relinking caches tracks under the playable alternative's id
 
-Status: **completed** (2026-08-01)
+Status: **completed 2026-08-01, then reversed 2026-08-13. Historical.** The rule this plan
+implemented — normalise every track back to its *original* id through a
+`RelinkableTrackCodable` protocol — is no longer the rule, and no code should be written from
+it. `CLAUDE.md` carries the current one under *Track identity is the market id*: the app keys
+everything on the id the API returned and never rewrites it.
+
+The reversal was forced rather than chosen. Normalising back requires `linked_from`, which
+only the Web API returns; search moved to pathfinder, which returns the market recording and
+carries no `linked_from` at all, so there is nothing left to trade the substitute back for.
+Every file this plan names is also gone — `SpotifyAPI+Tracks.swift`, `SpotifyAPI+Player.swift`
+and `APITypesTests.swift` were deleted with the Web API.
+
+What still holds, and is the reason this is kept: **one identity per track, or the store
+corrupts.** That was this plan's real finding. Which id carries the identity is what changed.
 Components: `Spotifly/SpotifyAPI/APITypes.swift`,
 `Spotifly/SpotifyAPI/SpotifyAPI+Tracks.swift`,
 `Spotifly/SpotifyAPI/SpotifyAPI+Player.swift`,
